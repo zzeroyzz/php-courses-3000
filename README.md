@@ -1,6 +1,8 @@
-# MLO Study
+# GA Real Estate Study
 
-A mobile-first NMLS Mortgage Loan Originator exam prep app with AI-generated study materials, spaced-repetition flashcards, and a gamification layer.
+A mobile-first study app for the Georgia Real Estate Licensing Course: an admin pastes each lesson, Claude generates sourced flashcards and practice questions, and every student studies with their own spaced-repetition schedule and progress.
+
+> Parts of this README below still describe v1 and are stale. ARCHITECTURE.md is the accurate reference.
 
 ## Features
 
