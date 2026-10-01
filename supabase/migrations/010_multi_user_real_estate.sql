@@ -89,6 +89,11 @@ ALTER TABLE public.lessons
 ALTER TABLE public.lessons
   ADD CONSTRAINT lessons_section_lesson_number_key UNIQUE (section_id, lesson_number);
 
+-- Lets list views tell empty lessons apart without downloading source_content
+-- for all ~350 lessons.
+ALTER TABLE public.lessons
+  ADD COLUMN has_source boolean GENERATED ALWAYS AS (source_content <> '') STORED;
+
 DROP INDEX IF EXISTS public.lessons_user_id_section_id_sort_order_idx;
 CREATE INDEX lessons_section_sort_idx ON public.lessons (section_id, sort_order);
 
@@ -191,5 +196,85 @@ $$;
 
 REVOKE ALL ON FUNCTION public.lesson_learner_count(uuid) FROM public;
 GRANT EXECUTE ON FUNCTION public.lesson_learner_count(uuid) TO authenticated;
+
+-- ── Study queries ────────────────────────────────────────────────────────────
+-- Aggregated in SQL because the course holds thousands of cards and PostgREST
+-- caps responses at 1000 rows: counting due cards client-side would silently
+-- truncate. All SECURITY INVOKER — RLS scopes card_progress / lesson_progress /
+-- attempts to the caller.
+--
+-- When is a card due for a user?
+--   * it has a card_progress row with due_at <= now, or
+--   * it has no row yet (never reviewed) AND the user has completed its lesson.
+-- New cards from lessons the user hasn't read stay off the global schedule;
+-- the lesson's own Cards tab introduces them (see study_cards).
+
+-- All cards of one lesson, merged with the caller's SM-2 state.
+-- due_at NULL = never reviewed.
+CREATE OR REPLACE FUNCTION public.study_cards(p_lesson_id uuid)
+RETURNS TABLE (
+  id uuid, lesson_id uuid, front text, back text, source_anchor text, created_at timestamptz,
+  ease numeric, interval_days int, due_at timestamptz, lapses int
+)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  SELECT f.id, f.lesson_id, f.front, f.back, f.source_anchor, f.created_at,
+         coalesce(cp.ease, 2.5), coalesce(cp.interval_days, 0), cp.due_at, coalesce(cp.lapses, 0)
+  FROM public.flashcards f
+  LEFT JOIN public.card_progress cp
+         ON cp.flashcard_id = f.id AND cp.user_id = auth.uid()
+  WHERE f.lesson_id = p_lesson_id
+  ORDER BY f.created_at;
+$$;
+
+-- The caller's global review queue (cross-lesson).
+CREATE OR REPLACE FUNCTION public.due_cards()
+RETURNS TABLE (
+  id uuid, lesson_id uuid, front text, back text, source_anchor text, created_at timestamptz,
+  ease numeric, interval_days int, due_at timestamptz, lapses int
+)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  SELECT f.id, f.lesson_id, f.front, f.back, f.source_anchor, f.created_at,
+         coalesce(cp.ease, 2.5), coalesce(cp.interval_days, 0), cp.due_at, coalesce(cp.lapses, 0)
+  FROM public.flashcards f
+  LEFT JOIN public.card_progress cp
+         ON cp.flashcard_id = f.id AND cp.user_id = auth.uid()
+  WHERE cp.due_at <= now()
+     OR (cp.flashcard_id IS NULL AND EXISTS (
+           SELECT 1 FROM public.lesson_progress lp
+           WHERE lp.lesson_id = f.lesson_id AND lp.user_id = auth.uid()));
+$$;
+
+-- Per-lesson due counts for the caller (only lessons with something due).
+CREATE OR REPLACE FUNCTION public.due_counts()
+RETURNS TABLE (lesson_id uuid, section_id uuid, due int)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  SELECT d.lesson_id, l.section_id, count(*)::int
+  FROM public.due_cards() d
+  JOIN public.lessons l ON l.id = d.lesson_id
+  GROUP BY d.lesson_id, l.section_id;
+$$;
+
+-- The caller's practice stats per section since a point in time:
+-- answers, correct answers, and how many distinct lessons they've answered in.
+CREATE OR REPLACE FUNCTION public.section_stats(p_since timestamptz)
+RETURNS TABLE (section_id uuid, answered int, correct int, lessons_attempted int)
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''
+AS $$
+  SELECT l.section_id,
+         count(*)::int,
+         count(*) FILTER (WHERE a.correct)::int,
+         count(DISTINCT l.id)::int
+  FROM public.attempts a
+  JOIN public.questions q ON q.id = a.question_id
+  JOIN public.lessons   l ON l.id = q.lesson_id
+  WHERE a.user_id = auth.uid() AND a.answered_at >= p_since
+  GROUP BY l.section_id;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.study_cards(uuid), public.due_cards(), public.due_counts(),
+  public.section_stats(timestamptz) TO authenticated;
 
 NOTIFY pgrst, 'reload schema';

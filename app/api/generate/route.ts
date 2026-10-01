@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@/utils/supabase/server';
 import * as db from '@/lib/db';
+import { COURSE_CONTEXT } from '@/lib/course';
+import { GENERATION_MODEL, requireAdmin } from '@/lib/generation';
 import type { QuestionMix } from '@/lib/db-types';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -34,25 +36,44 @@ function splitOnParagraphs(text: string, limit: number): string[] {
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
+//
+// Everything this route generates goes on the spaced-repetition schedule
+// (flashcards) or into scored practice (questions), so it must come from the
+// pasted source and nothing else, each item carrying a verbatim source_anchor.
+//
+// This is not caution for its own sake. Spaced repetition cements whatever it
+// schedules: a wrong flashcard reviewed eight times over six weeks becomes a
+// wrong answer the student trusts more than a right one they saw once. So the
+// drilled set must be the verifiable set. Elaboration beyond the source belongs
+// in the separate, visibly-marked depth layer (/api/generate-depth), which is a
+// text column and can never enter the review queue. Do not loosen this prompt
+// to "add helpful context".
+
+const SOURCING_RULES = `Sourcing rules — these override everything else:
+- Use ONLY facts stated in the source text. Do not add facts, numbers, deadlines, rule citations or exceptions from general knowledge, even if you believe them to be true.
+- Every question's correct answer and every flashcard's back must be directly supported by the source.
+- source_anchor: a short verbatim quote (≤30 words) copied exactly from the source that supports the answer.
+- If the source can only support fewer items than requested, return fewer.`;
 
 function firstChunkPrompt(mix: QuestionMix, n: number): string {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building study material for the NMLS Mortgage Loan Originator (MLO) licensing exam.
+  return `You are building study material for ${COURSE_CONTEXT}.
 
 Given a lesson title and source text, produce:
-1. A short "why it matters" paragraph (2–4 sentences) explaining why this topic appears on the NMLS exam and what a working MLO needs to know.
-2. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. A short "why it matters" paragraph (2–4 sentences) explaining, from the source, why this topic matters on the licensing exam and in a licensee's work.
+2. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 3. 8–20 flashcards (description→term: front describes a concept/situation, back gives the precise term/rule/number).
 
+${SOURCING_RULES}
+
 Question requirements:
-- Use named fictional borrowers (Maria, James, etc.) in scenario questions.
+- Use named fictional buyers, sellers, tenants and licensees in scenario questions.
 - All four options must be plausible; wrong answers should be true facts about related topics (true-but-incomplete distractors).
 - Avoid starting every stem with "Which of the following".
 - Explanation must say why the correct answer is right AND why the best wrong answer fails.
 - For calculation questions, show full worked arithmetic in the explanation.
-- source_anchor: a short verbatim quote (≤30 words) from the source that supports the correct answer.
 
 Return strict JSON only — no markdown fences, no preamble:
 {
@@ -77,13 +98,15 @@ function continuationChunkPrompt(mix: QuestionMix, n: number): string {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building additional study material for the NMLS MLO licensing exam from a continuation of a longer source document.
+  return `You are building additional study material for ${COURSE_CONTEXT}, from a continuation of a longer source document.
 
 Produce:
-1. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 2. 6–14 flashcards (description→term direction).
 
-Apply the same quality requirements: named fictional borrowers, plausible distractors, worked arithmetic, source_anchor ≤30 words verbatim from the source.
+${SOURCING_RULES}
+
+Apply the same quality requirements: named fictional buyers, sellers and licensees in scenarios, plausible distractors, worked arithmetic.
 
 Return strict JSON only — no markdown fences:
 {
@@ -141,34 +164,51 @@ function parseJSON<T>(text: string): T {
 export async function POST(request: NextRequest) {
   const body = await request.json() as {
     lessonId: string;
-    title: string;
-    sourceContent: string;
-    questionMix: QuestionMix;
     chunkFrom?: number;   // resume point; default 0 (full restart)
   };
 
-  const { lessonId, title, sourceContent, questionMix } = body;
+  const { lessonId } = body;
   const chunkFrom = body.chunkFrom ?? 0;
 
-  if (!sourceContent?.trim()) {
-    return NextResponse.json({ error: 'No source content provided' }, { status: 400 });
-  }
   if (!lessonId) {
     return NextResponse.json({ error: 'lessonId required' }, { status: 400 });
   }
 
   const supabase = await createClient();
+
+  const auth = await requireAdmin(supabase);
+  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
+  // Read title, source and question mix from the database rather than trusting
+  // the request body.
+  const lesson = await db.getLessonById(supabase, lessonId);
+  if (!lesson) return NextResponse.json({ error: 'Lesson not found' }, { status: 404 });
+  const section = await db.getSectionById(supabase, lesson.section_id);
+  if (!section) return NextResponse.json({ error: 'Section not found' }, { status: 404 });
+
+  const sourceContent = lesson.source_content;
+  const title = lesson.title;
+  const questionMix = section.question_mix;
+
+  if (!sourceContent?.trim()) {
+    return NextResponse.json({ error: 'Lesson has no source content' }, { status: 400 });
+  }
+
   const chunks = splitOnParagraphs(sourceContent.trim(), CHUNK_LIMIT);
   const totalWords = sourceContent.trim().split(/\s+/).length;
   const isMultiChunk = chunks.length > 1;
 
   console.log(`[generate] lesson=${lessonId} chunks=${chunks.length} totalChars=${sourceContent.length} resumeFrom=${chunkFrom}`);
 
-  // On a full restart (chunkFrom === 0), wipe any previous content
+  // On a full restart (chunkFrom === 0), wipe any previous content and mark the
+  // lesson as in progress so every viewer's status flips to 'generating'.
+  // Deleting flashcards/questions cascades to every student's card_progress and
+  // attempts for this lesson — the admin UI confirms that before calling here.
   if (chunkFrom === 0) {
     await db.deleteFlashcardsForLesson(supabase, lessonId);
     await db.deleteQuestionsForLesson(supabase, lessonId);
   }
+  await supabase.from('lessons').update({ generated_at: null, generation_chunk: null }).eq('id', lessonId);
 
   let whyItMatters: string | null = null;
 
@@ -193,7 +233,7 @@ export async function POST(request: NextRequest) {
 
     try {
       const message = await client.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: GENERATION_MODEL,
         max_tokens: 8192,
         system: systemPrompt,
         messages: [{ role: 'user', content: userMessage }],
@@ -256,12 +296,12 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // All chunks complete — mark lesson generated and clear chunk cursor
+  // All chunks complete — mark lesson generated (clears the chunk cursor). On a
+  // resume, chunk 0 didn't run, so keep the why_it_matters it already saved.
   await db.updateLessonGenerated(supabase, lessonId, {
-    why_it_matters: whyItMatters ?? '',
+    ...(whyItMatters !== null && { why_it_matters: whyItMatters }),
     generated_at: new Date().toISOString(),
   });
-  await supabase.from('lessons').update({ generation_chunk: null }).eq('id', lessonId);
 
   return NextResponse.json({ ok: true, chunks: chunks.length });
 }

@@ -6,14 +6,15 @@ import Link from 'next/link';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
 import * as db from '@/lib/db';
-import { scheduleCard, filterDue, shuffle } from '@/lib/srs';
-import type { Flashcard } from '@/lib/db-types';
+import { scheduleCard, shuffle } from '@/lib/srs';
+import type { StudyCard } from '@/lib/db-types';
 
 export default function ReviewPage() {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
 
-  const [queue, setQueue] = useState<Flashcard[]>([]);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [queue, setQueue] = useState<StudyCard[]>([]);
   const [idx, setIdx] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -24,19 +25,18 @@ export default function ReviewPage() {
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) { router.push('/sign-in'); return; }
-      const all = await db.getAllFlashcards(supabase, user.id);
-      const due = shuffle(filterDue(all));
-      setQueue(due);
+      setUserId(user.id);
+      setQueue(shuffle(await db.getDueCards(supabase)));
       setLoading(false);
     });
   }, [supabase, router]);
 
   async function handleAnswer(correct: boolean) {
     const card = queue[idx];
-    if (!card) return;
+    if (!card || !userId) return;
 
     const updates = scheduleCard(card, correct);
-    await db.updateFlashcardSRS(supabase, card.id, {
+    await db.saveCardReview(supabase, userId, card.id, {
       ease: updates.ease,
       interval_days: updates.interval_days,
       due_at: updates.due_at.toISOString(),
@@ -89,7 +89,7 @@ export default function ReviewPage() {
             <div className="rounded-lg p-8 text-center space-y-4" style={{ background: 'var(--color-surface)' }}>
               <p className="text-[22px] font-medium text-fg">All caught up</p>
               <p className="text-[15px] text-n400 leading-relaxed">
-                No cards are due right now. Come back tomorrow to keep your streak going.
+                No cards are due right now. Cards join your review schedule when you complete a lesson.
               </p>
               <Link href="/" className="btn btn-secondary btn-block mt-4">Back to home</Link>
             </div>
@@ -115,7 +115,6 @@ export default function ReviewPage() {
                 </div>
               </div>
               <Link href="/" className="btn btn-primary btn-block">Done</Link>
-              <Link href="/ingest" className="btn btn-secondary btn-block">Add more content</Link>
             </div>
           ) : (
             <div className="space-y-4">
@@ -139,7 +138,7 @@ export default function ReviewPage() {
                 }}
               >
                 <p className="text-[11px] font-medium text-n600 uppercase tracking-wide mb-5">
-                  {flipped ? 'Answer' : 'Term'}
+                  {flipped ? 'Answer' : 'Description'}
                 </p>
                 <p className="text-[24px] font-medium text-fg leading-relaxed flex-1">
                   {flipped ? card.back : card.front}
@@ -176,7 +175,7 @@ export default function ReviewPage() {
               {/* Source anchor */}
               {card.source_anchor && flipped && (
                 <Link
-                  href={`/lessons/${card.lesson_id}?tab=source`}
+                  href={`/lessons/${card.lesson_id}?tab=read&anchor=${encodeURIComponent(card.source_anchor)}`}
                   className="block text-[12px] text-n600 hover:text-n400 italic transition-colors text-center"
                 >
                   &ldquo;{card.source_anchor.slice(0, 60)}&hellip;&rdquo; →

@@ -1,9 +1,12 @@
-// v2 TypeScript types mirroring the Supabase database schema
+// TypeScript types mirroring the Supabase database schema
 
-// ── Gamification (unchanged from v1) ─────────────────────────────────────────
+// ── Profile ───────────────────────────────────────────────────────────────────
+
+export type Role = 'admin' | 'student';
 
 export type Profile = {
   user_id: string;
+  role: Role;
   xp: number;
   level: number;
   current_streak: number;
@@ -21,7 +24,7 @@ export type DBachievement = {
   unlocked_at: string;
 };
 
-// ── v2 Content types ──────────────────────────────────────────────────────────
+// ── Content (shared by all users, written by admins) ──────────────────────────
 
 export type QuestionMix = {
   factual: number;
@@ -33,33 +36,74 @@ export type Section = {
   id: string;
   slug: string;
   name: string;
-  exam_weight: number;   // 0.27 = 27% of the exam
+  chapter_number: number | null;   // null for Orientation / Final Exam
+  // Course-completion weight for now: the chapter's share of the course's
+  // lessons. See lib/course.ts PROGRESS_LABEL.
+  exam_weight: number;
   sort_order: number;
   question_mix: QuestionMix;
+  allow_generated_depth: boolean;  // false for Georgia statute chapters
 };
 
-// Derived status — computed from lesson fields, never stored
-export type LessonStatus = 'empty' | 'generating' | 'ready' | 'completed';
-
-export function lessonStatus(lesson: Lesson): LessonStatus {
-  if (!lesson.source_content) return 'empty';
-  if (!lesson.generated_at) return 'generating';
-  if (lesson.completed_at) return 'completed';
-  return 'ready';
+// "10 · Georgia Residential Landlord Tenant Act"; Orientation / Final Exam as-is.
+export function sectionLabel(section: Pick<Section, 'chapter_number' | 'name'>): string {
+  return section.chapter_number != null ? `${section.chapter_number} · ${section.name}` : section.name;
 }
 
-export type Lesson = {
+export type LessonKind = 'prose' | 'infographic' | 'quiz' | 'document';
+
+// What list views load — everything except the large text columns.
+export type LessonSummary = {
   id: string;
   section_id: string;
-  user_id: string;
+  created_by: string | null;
+  lesson_number: string | null;
   title: string;
+  kind: LessonKind;
   sort_order: number;
-  source_content: string;      // verbatim paste — NEVER overwritten by regeneration
-  why_it_matters: string | null;
-  generated_at: string | null; // null = generation not yet run
-  completed_at: string | null; // null = not yet marked complete
+  has_source: boolean;
+  generated_at: string | null;     // null = generation not complete
+  generation_chunk: number | null; // non-null = generation failed at this chunk
   created_at: string;
 };
+
+export type Lesson = LessonSummary & {
+  source_content: string;          // verbatim paste — NEVER overwritten by regeneration
+  why_it_matters: string | null;
+  // The generated "Going deeper" reading layer. Unsourced by design, so it is
+  // never drilled: it lives in this text column rather than as flashcard or
+  // question rows, which means nothing in it can reach the review queue.
+  depth_content: string | null;
+  depth_generated_at: string | null;
+};
+
+export const LESSON_SUMMARY_COLUMNS =
+  'id, section_id, created_by, lesson_number, title, kind, sort_order, has_source, generated_at, generation_chunk, created_at';
+
+// Global content state — the same for every user. Per-user completion is
+// separate (lesson_progress).
+export type ContentStatus = 'empty' | 'generating' | 'failed' | 'ready';
+
+export function contentStatus(
+  lesson: Pick<LessonSummary, 'has_source' | 'generated_at' | 'generation_chunk' | 'kind'>
+): ContentStatus {
+  if (!lesson.has_source) return 'empty';
+  if (lesson.generated_at) return 'ready';
+  // Document examples are reading material; drill generation is opt-in.
+  if (lesson.kind === 'document') return 'ready';
+  if (lesson.generation_chunk != null) return 'failed';
+  return 'generating';
+}
+
+// Image-only lessons count only once someone has typed up their content.
+export function countsTowardProgress(lesson: Pick<LessonSummary, 'kind' | 'has_source'>): boolean {
+  return lesson.kind !== 'infographic' || lesson.has_source;
+}
+
+// Display "10.3a" but not the synthetic keys the seed gives unnumbered lessons.
+export function displayLessonNumber(lesson: Pick<LessonSummary, 'lesson_number'>): string | null {
+  return lesson.lesson_number && /^\d+\.\d+[a-z]?$/.test(lesson.lesson_number) ? lesson.lesson_number : null;
+}
 
 export type QuestionType = 'factual' | 'scenario' | 'calculation';
 
@@ -69,11 +113,6 @@ export type Flashcard = {
   front: string;          // description / scenario side
   back: string;           // term / rule / number
   source_anchor: string | null;
-  // SM-2 scheduling state
-  ease: number;
-  interval_days: number;
-  due_at: string | null;  // null = due now (new or just lapsed)
-  lapses: number;
   created_at: string;
 };
 
@@ -89,6 +128,18 @@ export type Question = {
   created_at: string;
 };
 
+// ── Per-user study state ──────────────────────────────────────────────────────
+
+export type SrsState = {
+  ease: number;
+  interval_days: number;
+  due_at: string | null;  // null = this user has never reviewed the card
+  lapses: number;
+};
+
+// A shared card merged with the current user's scheduling state.
+export type StudyCard = Flashcard & SrsState;
+
 export type Attempt = {
   id: string;
   question_id: string;
@@ -98,28 +149,11 @@ export type Attempt = {
   answered_at: string;
 };
 
-// ── Convenience join types ────────────────────────────────────────────────────
+export type DueCount = { lesson_id: string; section_id: string; due: number };
 
-export type LessonWithCounts = Lesson & {
-  flashcard_count: number;
-  question_count: number;
-  due_count: number;        // SM-2 due cards right now
+export type SectionStats = {
+  section_id: string;
+  answered: number;
+  correct: number;
+  lessons_attempted: number;
 };
-
-export type SectionWithLessons = Section & {
-  lessons: LessonWithCounts[];
-};
-
-// ── Progress math ─────────────────────────────────────────────────────────────
-
-// Estimated scored questions secured = accuracy × (exam_weight × 115)
-// 115 = total scored questions on the NMLS exam
-export const EXAM_SCORED_QUESTIONS = 115;
-export const PASS_THRESHOLD = 86; // 75% of 115
-
-export function estimatedScoredQuestions(
-  section: Section,
-  accuracy: number // 0-1
-): number {
-  return accuracy * section.exam_weight * EXAM_SCORED_QUESTIONS;
-}

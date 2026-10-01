@@ -4,6 +4,7 @@
 :root {
   --color-bg:         #161826;
   --color-surface:    #232532;
+  --color-surface-sunk: #1b1d2c;
   --color-fg:         #e9e9ed;
   --color-accent:     #9184d9;
   --color-divider:    color-mix(in srgb, #e9e9ed 16%, transparent);
@@ -24,6 +25,7 @@
 @theme inline {
   --color-bg:         #161826;
   --color-surface:    #232532;
+  --color-surface-sunk: #1b1d2c;
   --color-fg:         #e9e9ed;
   --color-accent:     #9184d9;
   --color-divider:    color-mix(in srgb, #e9e9ed 16%, transparent);

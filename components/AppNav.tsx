@@ -7,15 +7,17 @@ import { House, Cards, Plus } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import * as db from '@/lib/db';
 import { getLevelInfo } from '@/lib/gamification';
-import { filterDue } from '@/lib/srs';
+import { getViewer } from '@/lib/viewer';
+import { APP_NAME } from '@/lib/course';
+import { sectionLabel } from '@/lib/db-types';
 import type { Section, Profile } from '@/lib/db-types';
 
-type RailData = { sections: Section[]; totalDue: number; profile: Profile | null };
+type RailData = { sections: Section[]; totalDue: number; profile: Profile | null; isAdmin: boolean };
 
 const NAV = [
-  { href: '/',        label: 'Home',   Icon: House },
-  { href: '/review',  label: 'Review', Icon: Cards },
-  { href: '/ingest',  label: 'Add',    Icon: Plus  },
+  { href: '/',        label: 'Home',   Icon: House, adminOnly: false },
+  { href: '/review',  label: 'Review', Icon: Cards, adminOnly: false },
+  { href: '/ingest',  label: 'Add',    Icon: Plus,  adminOnly: true  },
 ] as const;
 
 export function AppNav() {
@@ -25,15 +27,16 @@ export function AppNav() {
   const [rail, setRail] = useState<RailData | null>(null);
 
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data: { user } }) => {
-      if (!user) return;
-      const [sections, allCards, profile] = await Promise.all([
+    (async () => {
+      const [viewer, sections, dueCounts] = await Promise.all([
+        getViewer(supabase),
         db.getSections(supabase),
-        db.getAllFlashcards(supabase, user.id),
-        db.getProfile(supabase, user.id),
+        db.getDueCounts(supabase),
       ]);
-      setRail({ sections, totalDue: filterDue(allCards).length, profile });
-    });
+      if (!viewer) return;
+      const totalDue = dueCounts.reduce((s, d) => s + d.due, 0);
+      setRail({ sections, totalDue, profile: viewer.profile, isAdmin: viewer.isAdmin });
+    })();
   }, [supabase]);
 
   async function signOut() {
@@ -44,15 +47,18 @@ export function AppNav() {
   const active = (href: string) =>
     href === '/' ? pathname === '/' : pathname.startsWith(href);
 
+  // Admin-only items stay hidden until the role is known, so they never flash in.
+  const navItems = NAV.filter((item) => !item.adminOnly || rail?.isAdmin);
+
   return (
     <>
       {/* ── Phone bottom bar ── */}
       <nav
         className="md:hidden fixed bottom-0 left-0 right-0 z-50 pb-safe"
-        style={{ background: '#1b1d2c', boxShadow: '0 -1px 0 rgba(233,233,237,.1)' }}
+        style={{ background: 'var(--color-surface-sunk)', boxShadow: '0 -1px 0 rgba(233,233,237,.1)' }}
       >
         <div className="flex">
-          {NAV.map(({ href, label, Icon }) => {
+          {navItems.map(({ href, label, Icon }) => {
             const isActive = active(href);
             const badge = href === '/review' && rail && rail.totalDue > 0 ? rail.totalDue : null;
             return (
@@ -87,12 +93,12 @@ export function AppNav() {
       >
         {/* Brand */}
         <div className="px-5 py-5" style={{ borderBottom: '1px solid var(--color-divider)' }}>
-          <Link href="/" className="text-[15px] font-medium text-fg">MLO Study</Link>
+          <Link href="/" className="text-[15px] font-medium text-fg">{APP_NAME}</Link>
         </div>
 
         {/* Nav items */}
         <div className="px-3 py-4 space-y-0.5">
-          {NAV.map(({ href, label, Icon }) => {
+          {navItems.map(({ href, label, Icon }) => {
             const isActive = active(href);
             const badge = href === '/review' && rail && rail.totalDue > 0 ? rail.totalDue : null;
             return (
@@ -127,16 +133,17 @@ export function AppNav() {
             style={{ borderTop: '1px solid var(--color-divider)' }}
           >
             <p className="px-3 pt-4 pb-2 text-[11px] font-medium uppercase tracking-wide text-n600">
-              Sections
+              Chapters
             </p>
             {rail.sections.map((s) => (
               <Link
                 key={s.id}
                 href={`/sections/${s.slug}`}
+                title={sectionLabel(s)}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[13px] transition-colors text-n500 hover:text-fg"
               >
                 <span className="w-1 h-1 rounded-full bg-n700 shrink-0" />
-                <span className="truncate">{s.name}</span>
+                <span className="truncate">{sectionLabel(s)}</span>
               </Link>
             ))}
           </div>

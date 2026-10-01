@@ -1,30 +1,47 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { CheckCircle } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
+import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
-import type { Lesson, Section } from '@/lib/db-types';
+import { displayLessonNumber, sectionLabel } from '@/lib/db-types';
+import type { Lesson, LessonSummary, Section } from '@/lib/db-types';
 
 type Step = 'form' | 'saving' | 'generating' | 'done' | 'error';
 
+const KIND_HINT: Record<LessonSummary['kind'], string | null> = {
+  prose: null,
+  infographic: 'Image-only lesson on the course platform. Paste a text description to make it studyable.',
+  quiz: 'Course quiz. Paste the questions; cards and practice are generated from them.',
+  document: 'Document example. Saved as reading material; cards and practice are not generated for documents.',
+};
+
+// useSearchParams needs a Suspense boundary on a prerendered page.
 export default function IngestPage() {
+  return (
+    <Suspense>
+      <Ingest />
+    </Suspense>
+  );
+}
+
+function Ingest() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const supabase = useMemo(() => createClient(), []);
 
   const [userId, setUserId] = useState<string | null>(null);
   const [sections, setSections] = useState<Section[]>([]);
+  const [lessons, setLessons] = useState<LessonSummary[]>([]);   // course order
+  const [loading, setLoading] = useState(true);
   const [step, setStep] = useState<Step>('form');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const [sectionId, setSectionId] = useState('');
-  const [title, setTitle] = useState('');
+  const [lessonId, setLessonId] = useState('');
   const [sourceContent, setSourceContent] = useState('');
-
-  const [savedLessonId, setSavedLessonId] = useState<string | null>(null);
-  const [savedSectionSlug, setSavedSectionSlug] = useState<string | null>(null);
 
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -35,40 +52,51 @@ export default function IngestPage() {
   }
 
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data: { user } }) => {
-      if (!user) { router.push('/sign-in'); return; }
-      setUserId(user.id);
-      const sects = await db.getSections(supabase);
+    (async () => {
+      const viewer = await getViewer(supabase);
+      if (!viewer) { router.push('/sign-in'); return; }
+      if (!viewer.isAdmin) { router.replace('/'); return; }
+      setUserId(viewer.user.id);
+
+      const [sects, summaries] = await Promise.all([db.getSections(supabase), db.getLessonSummaries(supabase)]);
+      const order = new Map(sects.map((s, i) => [s.id, i]));
+      const inOrder = [...summaries].sort(
+        (a, b) => (order.get(a.section_id) ?? 0) - (order.get(b.section_id) ?? 0) || a.sort_order - b.sort_order
+      );
       setSections(sects);
-      if (sects.length > 0) setSectionId(sects[0].id);
-    });
+      setLessons(inOrder);
+
+      const requested = searchParams.get('lesson');
+      const initial = inOrder.find((l) => l.id === requested && !l.has_source)
+        ?? inOrder.find((l) => !l.has_source && l.kind !== 'infographic');
+      if (initial) setLessonId(initial.id);
+      setLoading(false);
+    })();
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supabase, router]);
 
+  const emptyLessons = lessons.filter((l) => !l.has_source);
+  const lesson = lessons.find((l) => l.id === lessonId) ?? null;
+  const section = lesson ? sections.find((s) => s.id === lesson.section_id) ?? null : null;
+  const sectionEmptyLessons = section ? emptyLessons.filter((l) => l.section_id === section.id) : [];
+
   const wordCount = sourceContent.trim() ? sourceContent.trim().split(/\s+/).length : 0;
-  const canSubmit = sectionId && title.trim() && sourceContent.trim().length > 50;
+  const canSubmit = !!lesson && !lesson.has_source && sourceContent.trim().length > 50;
   const isActive = step === 'form' || step === 'error';
 
   async function handleSubmit() {
-    if (!userId || !canSubmit) return;
+    if (!userId || !lesson || !canSubmit) return;
     setErrorMsg(null);
-
-    const section = sections.find((s) => s.id === sectionId);
-    if (!section) return;
-
     setStep('saving');
-    const lesson = await db.createLesson(supabase, {
-      section_id: sectionId,
-      user_id: userId,
-      title: title.trim(),
-      source_content: sourceContent,
-    });
 
-    if (!lesson) { setErrorMsg('Failed to save. Please try again.'); setStep('error'); return; }
+    // Save the paste first: a failed generation can never lose the source.
+    const saved = await db.saveLessonSource(supabase, lesson.id, sourceContent, userId);
+    if (!saved) { setErrorMsg('Failed to save. Please try again.'); setStep('error'); return; }
+    setLessons((prev) => prev.map((l) => l.id === lesson.id ? { ...l, has_source: true } : l));
 
-    setSavedLessonId(lesson.id);
-    setSavedSectionSlug(section.slug);
+    if (lesson.kind === 'document') { setStep('done'); return; }
+
     setStep('generating');
 
     const channel = supabase
@@ -77,7 +105,13 @@ export default function IngestPage() {
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'lessons', filter: `id=eq.${lesson.id}` },
         (payload) => {
-          if ((payload.new as Lesson).generated_at) { cleanup(); setStep('done'); }
+          const row = payload.new as Lesson;
+          if (row.generated_at) { cleanup(); setStep('done'); }
+          else if (row.generation_chunk != null) {
+            cleanup();
+            setErrorMsg('Generation stopped partway. Your source is saved; resume it from the chapter page.');
+            setStep('done');
+          }
         }
       )
       .subscribe();
@@ -92,57 +126,64 @@ export default function IngestPage() {
     fetch('/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        lessonId: lesson.id,
-        title: lesson.title,
-        sourceContent: lesson.source_content,
-        questionMix: section.question_mix,
-      }),
+      body: JSON.stringify({ lessonId: lesson.id }),
     }).catch(() => {});
   }
 
-  function resetForNext() {
-    setTitle(''); setSourceContent(''); setErrorMsg(null);
-    setSavedLessonId(null); setSavedSectionSlug(null); setStep('form');
+  function pasteNext() {
+    const idx = lessons.findIndex((l) => l.id === lessonId);
+    const next = lessons.slice(idx + 1).find((l) => !l.has_source && l.kind !== 'infographic')
+      ?? lessons.find((l) => !l.has_source && l.kind !== 'infographic');
+    setLessonId(next?.id ?? '');
+    setSourceContent(''); setErrorMsg(null); setStep('form');
   }
+
+  const label = (l: LessonSummary) => `${displayLessonNumber(l) ? `${displayLessonNumber(l)} ` : ''}${l.title}`;
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
       <AppNav />
 
-      <div className="md:ml-56 flex flex-col md:flex-row min-h-dvh">
-        {/* ── Left: form ── */}
-        <div className="flex-1 max-w-2xl mx-auto w-full px-5 py-6 space-y-5">
+      <div className="md:ml-56">
+        <div className="max-w-2xl mx-auto w-full px-5 py-6 space-y-5">
           <header>
-            <h1 className="text-[17px] font-medium text-fg">Add lesson</h1>
-            <p className="text-[13px] text-n500 mt-0.5">Paste content — source is saved immediately</p>
+            <h1 className="text-[17px] font-medium text-fg">Add lesson content</h1>
+            <p className="text-[13px] text-n500 mt-0.5">
+              {loading ? 'Loading…' : `${emptyLessons.length} lesson${emptyLessons.length !== 1 ? 's' : ''} still empty · source is saved immediately`}
+            </p>
           </header>
 
+          {!loading && !lesson && step === 'form' && (
+            <div className="rounded-lg p-6" style={{ background: 'var(--color-surface)' }}>
+              <p className="text-[15px] font-medium text-fg">Every lesson has content</p>
+              <p className="text-[13px] text-n500 mt-1">There are no empty lessons left to fill.</p>
+            </div>
+          )}
+
           {/* Done state */}
-          {step === 'done' && savedLessonId && savedSectionSlug && (
+          {step === 'done' && lesson && section && (
             <div className="rounded-lg p-6 space-y-5" style={{ background: 'var(--color-surface)' }}>
               <div className="flex items-center gap-2">
                 <CheckCircle size={18} weight="fill" style={{ color: 'var(--color-accent-md)' }} />
                 <span className="text-[14px] font-medium" style={{ color: 'var(--color-accent-md)' }}>Saved</span>
-                {!errorMsg && <span className="text-[13px] text-n600">· generation complete</span>}
+                {!errorMsg && lesson.kind !== 'document' && <span className="text-[13px] text-n600">· generation complete</span>}
               </div>
-              <p className="text-[17px] font-medium text-fg leading-snug">{title}</p>
+              <p className="text-[17px] font-medium text-fg leading-snug">{label(lesson)}</p>
               {errorMsg && (
-                <p className="text-[13px] text-n500 leading-relaxed rounded-lg px-4 py-3"
-                  style={{ background: 'var(--color-bg)' }}>
+                <p className="text-[13px] text-n500 leading-relaxed rounded-lg px-4 py-3" style={{ background: 'var(--color-bg)' }}>
                   {errorMsg}
                 </p>
               )}
               <div className="space-y-2">
-                <a href={`/lessons/${savedLessonId}`} className="btn btn-primary btn-block">View lesson →</a>
-                <a href={`/sections/${savedSectionSlug}`} className="btn btn-secondary btn-block">Section overview</a>
-                <button onClick={resetForNext} className="btn btn-secondary btn-block">Paste next lesson</button>
+                <a href={`/lessons/${lesson.id}`} className="btn btn-primary btn-block">View lesson →</a>
+                <a href={`/sections/${section.slug}`} className="btn btn-secondary btn-block">Chapter overview</a>
+                <button onClick={pasteNext} className="btn btn-secondary btn-block">Paste next lesson</button>
               </div>
             </div>
           )}
 
           {/* Form */}
-          {(step === 'form' || step === 'saving' || step === 'generating' || step === 'error') && (
+          {lesson && section && step !== 'done' && (
             <div className="space-y-4">
               {errorMsg && step === 'error' && (
                 <div className="rounded-lg px-4 py-3 text-[13px] text-n400"
@@ -152,37 +193,51 @@ export default function IngestPage() {
               )}
 
               <div className="field">
-                <label>Section</label>
+                <label>Chapter</label>
                 <select
-                  value={sectionId}
-                  onChange={(e) => setSectionId(e.target.value)}
+                  value={section.id}
+                  onChange={(e) => {
+                    const first = emptyLessons.find((l) => l.section_id === e.target.value);
+                    if (first) setLessonId(first.id);
+                  }}
                   disabled={!isActive}
                   className="input"
                   style={{ appearance: 'none' }}
                 >
-                  {sections.map((s) => (
-                    <option key={s.id} value={s.id}>{s.name}</option>
-                  ))}
+                  {sections.map((s) => {
+                    const empties = emptyLessons.filter((l) => l.section_id === s.id).length;
+                    return (
+                      <option key={s.id} value={s.id} disabled={empties === 0}>
+                        {sectionLabel(s)}{empties === 0 ? ' — all added' : ` — ${empties} empty`}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
 
               <div className="field">
-                <label>Lesson title</label>
-                <input
-                  type="text"
-                  placeholder="e.g. TRID Fee Tolerances"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
+                <label>Lesson</label>
+                <select
+                  value={lesson.id}
+                  onChange={(e) => setLessonId(e.target.value)}
                   disabled={!isActive}
                   className="input"
-                />
+                  style={{ appearance: 'none' }}
+                >
+                  {sectionEmptyLessons.map((l) => (
+                    <option key={l.id} value={l.id}>{label(l)}</option>
+                  ))}
+                </select>
+                {KIND_HINT[lesson.kind] && (
+                  <p className="text-[12px] text-n600 mt-1.5 leading-relaxed">{KIND_HINT[lesson.kind]}</p>
+                )}
               </div>
 
               <div className="field">
                 <label>Source content</label>
                 <textarea
                   rows={14}
-                  placeholder="Paste the prep guide text here…"
+                  placeholder="Paste the lesson text from the course here…"
                   value={sourceContent}
                   onChange={(e) => setSourceContent(e.target.value)}
                   disabled={!isActive}
@@ -193,7 +248,7 @@ export default function IngestPage() {
                   <p className="text-[11px] text-n700 tabular-nums">
                     {wordCount > 0 ? `${wordCount.toLocaleString()} words` : ''}
                   </p>
-                  {wordCount > 0 && (
+                  {wordCount > 0 && lesson.kind !== 'document' && (
                     <p className="text-[11px] text-n700 tabular-nums">
                       ~{Math.max(12, Math.min(30, Math.round(wordCount / 130)))} questions
                     </p>
@@ -211,6 +266,8 @@ export default function IngestPage() {
                   <span className="flex items-center gap-2"><Spinner /> Saving source…</span>
                 ) : step === 'generating' ? (
                   <span className="flex items-center gap-2"><Spinner /> Generating…</span>
+                ) : lesson.kind === 'document' ? (
+                  'Save'
                 ) : (
                   'Save & Generate'
                 )}

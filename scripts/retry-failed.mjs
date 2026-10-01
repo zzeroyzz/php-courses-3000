@@ -94,20 +94,24 @@ function buildFirstChunkPrompt(mix, n) {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building study material for the NMLS Mortgage Loan Originator (MLO) licensing exam.
+  return `You are building study material for the Georgia real estate salesperson pre-license course, preparing for the Georgia real estate salesperson licensing exam.
 
 Given a lesson title and source text, produce:
-1. A short "why it matters" paragraph (2–4 sentences) explaining why this topic appears on the NMLS exam and what a working MLO needs to know.
-2. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. A short "why it matters" paragraph (2–4 sentences) explaining, from the source, why this topic matters on the licensing exam and in a licensee's work.
+2. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 3. 8–20 flashcards (description→term: front describes a concept/situation, back gives the precise term/rule/number).
 
+Sourcing rules (these override everything else; see the note in app/api/generate/route.ts — drilled content must be verifiable):
+- Use ONLY facts stated in the source text. Do not add facts, numbers, deadlines, rule citations or exceptions from general knowledge.
+- Every answer and flashcard back must be directly supported by the source; source_anchor is a verbatim quote ≤30 words copied exactly from it.
+- If the source supports fewer items than requested, return fewer.
+
 Question requirements:
-- Use named fictional borrowers (Maria, James, etc.) in scenario questions.
+- Use named fictional buyers, sellers, tenants and licensees in scenario questions.
 - All four options plausible; wrong answers = true facts about related topics (true-but-incomplete distractors).
 - Vary qualifiers; avoid starting every stem with "Which of the following".
 - Explanation: why correct AND why best distractor fails.
 - Calculation questions: show full worked arithmetic in explanation.
-- source_anchor: verbatim quote ≤30 words from the source supporting the correct answer.
 
 Return strict JSON only — no markdown fences, no preamble:
 {
@@ -125,13 +129,18 @@ function buildContinuationChunkPrompt(mix, n) {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building additional study material for the NMLS MLO licensing exam from a continuation of a longer source document.
+  return `You are building additional study material for the Georgia real estate salesperson pre-license course, preparing for the Georgia real estate salesperson licensing exam, from a continuation of a longer source document.
 
 Produce:
-1. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 2. 6–14 flashcards (description→term direction).
 
-Same quality requirements: named fictional borrowers, plausible distractors, worked arithmetic, source_anchor ≤30 words verbatim from the source.
+Sourcing rules (these override everything else; see the note in app/api/generate/route.ts — drilled content must be verifiable):
+- Use ONLY facts stated in the source text. Do not add facts, numbers, deadlines, rule citations or exceptions from general knowledge.
+- Every answer and flashcard back must be directly supported by the source; source_anchor is a verbatim quote ≤30 words copied exactly from it.
+- If the source supports fewer items than requested, return fewer.
+
+Same quality requirements: named fictional buyers, sellers and licensees, plausible distractors, worked arithmetic.
 
 Return strict JSON only — no markdown fences:
 {
@@ -270,8 +279,9 @@ FROM jsonb_array_elements(${pgLiteral(qJson)}::jsonb) AS q;
 
   // All chunks done — mark complete
   const ts = new Date().toISOString();
-  const wimSql = whyItMatters ? whyItMatters.replace(/'/g, "''") : '';
-  psql(`UPDATE lessons SET generated_at = '${ts}', generation_chunk = NULL, why_it_matters = '${wimSql}' WHERE id = '${id}'`);
+  // On a resume chunk 0 didn't run, so keep the why_it_matters it already saved.
+  const wimSet = whyItMatters ? `, why_it_matters = '${whyItMatters.replace(/'/g, "''")}'` : '';
+  psql(`UPDATE lessons SET generated_at = '${ts}', generation_chunk = NULL${wimSet} WHERE id = '${id}'`);
 
   // Count what we inserted
   const qCount = psql(`SELECT COUNT(*) FROM questions  WHERE lesson_id = '${id}'`);
@@ -296,6 +306,7 @@ SELECT json_agg(row_to_json(t)) FROM (
   FROM lessons l
   JOIN sections s ON s.id = l.section_id
   WHERE l.generated_at IS NULL AND l.source_content != ''
+    AND l.kind <> 'document'  -- drill generation is opt-in for document examples
   ${singleId ? `AND l.id = '${singleId}'` : ''}
   ORDER BY length(l.source_content) ASC
 ) t

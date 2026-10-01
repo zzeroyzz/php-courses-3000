@@ -1,11 +1,14 @@
-import type { Flashcard } from './db-types';
+import type { SrsState } from './db-types';
 
 // SM-2 spaced repetition scheduling
 // Based on the SuperMemo SM-2 algorithm with minor simplifications.
+//
+// Pure functions over one user's SrsState (card_progress). Cards are shared;
+// scheduling is per user.
 
 // Returns the updated SM-2 fields for a card after a review.
 export function scheduleCard(
-  card: Pick<Flashcard, 'ease' | 'interval_days' | 'lapses'>,
+  card: Pick<SrsState, 'ease' | 'interval_days' | 'lapses'>,
   correct: boolean
 ): { ease: number; interval_days: number; due_at: Date; lapses: number } {
   let { ease, interval_days, lapses } = card;
@@ -34,16 +37,18 @@ export function scheduleCard(
   return { ease, interval_days, due_at, lapses };
 }
 
-export function isDue(card: Pick<Flashcard, 'due_at'>): boolean {
-  if (!card.due_at) return true; // new card
+// due_at null = never reviewed by this user. Inside a lesson that counts as due:
+// studying the lesson is what introduces its cards.
+export function isDue(card: Pick<SrsState, 'due_at'>): boolean {
+  if (!card.due_at) return true;
   return new Date(card.due_at) <= new Date();
 }
 
-export function filterDue<T extends Pick<Flashcard, 'due_at'>>(cards: T[]): T[] {
+export function filterDue<T extends Pick<SrsState, 'due_at'>>(cards: T[]): T[] {
   return cards.filter(isDue);
 }
 
-export function daysUntilDue(card: Pick<Flashcard, 'due_at'>): number {
+export function daysUntilDue(card: Pick<SrsState, 'due_at'>): number {
   if (!card.due_at) return 0;
   const diff = new Date(card.due_at).getTime() - Date.now();
   return Math.max(0, Math.ceil(diff / 86400000));

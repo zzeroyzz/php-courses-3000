@@ -1,13 +1,23 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type {
-  Profile,
-  DBachievement,
-  Section,
-  Lesson,
-  Flashcard,
-  Question,
-  Attempt,
+import {
+  LESSON_SUMMARY_COLUMNS,
+  type Profile,
+  type DBachievement,
+  type Section,
+  type Lesson,
+  type LessonSummary,
+  type Flashcard,
+  type StudyCard,
+  type Question,
+  type Attempt,
+  type DueCount,
+  type SectionStats,
 } from './db-types';
+
+// Content tables (sections, lessons, flashcards, questions) are shared: RLS lets
+// every signed-in user read them and only admins write them. Study state
+// (card_progress, lesson_progress, attempts) is per-user and RLS-scoped to the
+// caller, so those queries need no user filter beyond what RLS applies.
 
 // ── Profile ───────────────────────────────────────────────────────────────────
 
@@ -31,7 +41,8 @@ export async function getProfile(
 export async function upsertProfile(
   supabase: SupabaseClient,
   userId: string,
-  updates: Partial<Omit<Profile, 'user_id' | 'created_at' | 'updated_at'>>
+  // role is not client-writable (column grants in migration 010)
+  updates: Partial<Omit<Profile, 'user_id' | 'role' | 'created_at' | 'updated_at'>>
 ): Promise<void> {
   const { error } = await supabase
     .from('profiles')
@@ -92,23 +103,35 @@ export async function getSectionBySlug(
   return data as Section;
 }
 
+export async function getSectionById(
+  supabase: SupabaseClient,
+  sectionId: string
+): Promise<Section | null> {
+  const { data, error } = await supabase
+    .from('sections')
+    .select('*')
+    .eq('id', sectionId)
+    .single();
+  if (error) { console.error('[db] getSectionById', error.message); return null; }
+  return data as Section;
+}
+
 // ── Lessons ───────────────────────────────────────────────────────────────────
 
-export async function getLessons(
+// Summaries only — never source_content, which across ~350 lessons is megabytes.
+export async function getLessonSummaries(
   supabase: SupabaseClient,
-  userId: string,
   sectionId?: string
-): Promise<Lesson[]> {
+): Promise<LessonSummary[]> {
   let query = supabase
     .from('lessons')
-    .select('*')
-    .eq('user_id', userId)
+    .select(LESSON_SUMMARY_COLUMNS)
     .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true });
   if (sectionId) query = query.eq('section_id', sectionId);
   const { data, error } = await query;
-  if (error) { console.error('[db] getLessons', error.message); return []; }
-  return data as Lesson[];
+  if (error) { console.error('[db] getLessonSummaries', error.message); return []; }
+  return data as unknown as LessonSummary[];
 }
 
 export async function getLessonById(
@@ -124,98 +147,139 @@ export async function getLessonById(
   return data as Lesson;
 }
 
-export async function createLesson(
+// Admin: paste content into a seeded lesson. Resets generation state so the
+// lesson reads as 'generating' until /api/generate finishes.
+export async function saveLessonSource(
   supabase: SupabaseClient,
-  lesson: {
-    section_id: string;
-    user_id: string;
-    title: string;
-    source_content: string;
-    sort_order?: number;
-  }
-): Promise<Lesson | null> {
-  const { data, error } = await supabase
+  lessonId: string,
+  sourceContent: string,
+  createdBy: string
+): Promise<boolean> {
+  const { error } = await supabase
     .from('lessons')
-    .insert({ sort_order: 0, ...lesson })
-    .select()
-    .single();
-  if (error) { console.error('[db] createLesson', error.message); return null; }
-  return data as Lesson;
+    .update({
+      source_content: sourceContent,
+      created_by: createdBy,
+      generated_at: null,
+      generation_chunk: null,
+    })
+    .eq('id', lessonId);
+  if (error) { console.error('[db] saveLessonSource', error.message); return false; }
+  return true;
 }
 
 export async function updateLessonGenerated(
   supabase: SupabaseClient,
   lessonId: string,
-  updates: { why_it_matters: string; generated_at: string }
+  updates: { why_it_matters?: string; generated_at: string }
 ): Promise<void> {
   const { error } = await supabase
     .from('lessons')
-    .update(updates)
+    .update({ ...updates, generation_chunk: null })
     .eq('id', lessonId);
   if (error) console.error('[db] updateLessonGenerated', error.message);
 }
 
+export async function updateLessonDepth(
+  supabase: SupabaseClient,
+  lessonId: string,
+  depthContent: string
+): Promise<boolean> {
+  const { error } = await supabase
+    .from('lessons')
+    .update({ depth_content: depthContent, depth_generated_at: new Date().toISOString() })
+    .eq('id', lessonId);
+  if (error) { console.error('[db] updateLessonDepth', error.message); return false; }
+  return true;
+}
+
+// How many students have progress that regenerating this lesson would erase.
+export async function getLessonLearnerCount(
+  supabase: SupabaseClient,
+  lessonId: string
+): Promise<number> {
+  const { data, error } = await supabase.rpc('lesson_learner_count', { p_lesson_id: lessonId });
+  if (error) { console.error('[db] getLessonLearnerCount', error.message); return 0; }
+  return (data as number) ?? 0;
+}
+
+// ── Lesson completion (per user) ──────────────────────────────────────────────
+
+export async function getCompletedLessonIds(supabase: SupabaseClient): Promise<Set<string>> {
+  const { data, error } = await supabase.from('lesson_progress').select('lesson_id');
+  if (error) { console.error('[db] getCompletedLessonIds', error.message); return new Set(); }
+  return new Set((data as { lesson_id: string }[]).map((r) => r.lesson_id));
+}
+
+export async function getLessonCompletedAt(
+  supabase: SupabaseClient,
+  lessonId: string
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('lesson_progress')
+    .select('completed_at')
+    .eq('lesson_id', lessonId)
+    .maybeSingle();
+  if (error) { console.error('[db] getLessonCompletedAt', error.message); return null; }
+  return (data as { completed_at: string } | null)?.completed_at ?? null;
+}
+
+// Completing a lesson also puts its unreviewed cards on the global review
+// schedule (see due_cards() in migration 010).
 export async function markLessonComplete(
   supabase: SupabaseClient,
+  userId: string,
   lessonId: string
 ): Promise<void> {
   const { error } = await supabase
-    .from('lessons')
-    .update({ completed_at: new Date().toISOString() })
-    .eq('id', lessonId);
+    .from('lesson_progress')
+    .upsert({ user_id: userId, lesson_id: lessonId }, { onConflict: 'user_id,lesson_id', ignoreDuplicates: true });
   if (error) console.error('[db] markLessonComplete', error.message);
-}
-
-export async function getLessonCountForSection(
-  supabase: SupabaseClient,
-  userId: string,
-  sectionId: string
-): Promise<number> {
-  const { count, error } = await supabase
-    .from('lessons')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .eq('section_id', sectionId);
-  if (error) { console.error('[db] getLessonCountForSection', error.message); return 0; }
-  return count ?? 0;
 }
 
 // ── Flashcards ────────────────────────────────────────────────────────────────
 
-export async function getFlashcards(
+// A lesson's cards merged with the caller's scheduling state.
+export async function getStudyCards(
   supabase: SupabaseClient,
   lessonId: string
-): Promise<Flashcard[]> {
-  const { data, error } = await supabase
-    .from('flashcards')
-    .select('*')
-    .eq('lesson_id', lessonId)
-    .order('created_at', { ascending: true });
-  if (error) { console.error('[db] getFlashcards', error.message); return []; }
-  return data as Flashcard[];
+): Promise<StudyCard[]> {
+  const { data, error } = await supabase.rpc('study_cards', { p_lesson_id: lessonId });
+  if (error) { console.error('[db] getStudyCards', error.message); return []; }
+  return data as StudyCard[];
 }
 
-// Load all cards for a user (for global review queue), joining through lessons
-export async function getAllFlashcards(
+// The caller's cross-lesson review queue.
+export async function getDueCards(supabase: SupabaseClient): Promise<StudyCard[]> {
+  const { data, error } = await supabase.rpc('due_cards');
+  if (error) { console.error('[db] getDueCards', error.message); return []; }
+  return data as StudyCard[];
+}
+
+export async function getDueCounts(supabase: SupabaseClient): Promise<DueCount[]> {
+  const { data, error } = await supabase.rpc('due_counts');
+  if (error) { console.error('[db] getDueCounts', error.message); return []; }
+  return data as DueCount[];
+}
+
+export async function saveCardReview(
   supabase: SupabaseClient,
   userId: string,
-  sectionId?: string
-): Promise<Flashcard[]> {
-  // Join flashcards → lessons to filter by user_id (RLS handles auth, but we need the join for sectionId)
-  let query = supabase
-    .from('flashcards')
-    .select('*, lessons!inner(user_id, section_id)')
-    .eq('lessons.user_id', userId);
-  if (sectionId) query = query.eq('lessons.section_id', sectionId);
-  const { data, error } = await query;
-  if (error) { console.error('[db] getAllFlashcards', error.message); return []; }
-  // Strip the nested lessons join from the returned rows
-  return (data as (Flashcard & { lessons: unknown })[]).map(({ lessons: _l, ...card }) => card as Flashcard);
+  cardId: string,
+  state: { ease: number; interval_days: number; due_at: string; lapses: number }
+): Promise<void> {
+  const { error } = await supabase
+    .from('card_progress')
+    .upsert(
+      { user_id: userId, flashcard_id: cardId, ...state, reviewed_at: new Date().toISOString() },
+      { onConflict: 'user_id,flashcard_id' }
+    );
+  if (error) console.error('[db] saveCardReview', error.message);
 }
 
 export async function insertFlashcards(
   supabase: SupabaseClient,
-  cards: Omit<Flashcard, 'id' | 'ease' | 'interval_days' | 'due_at' | 'lapses' | 'created_at'>[]
+  cards: Omit<Flashcard, 'id' | 'created_at'>[]
 ): Promise<void> {
   if (cards.length === 0) return;
   const { error } = await supabase.from('flashcards').insert(cards);
@@ -233,18 +297,6 @@ export async function deleteFlashcardsForLesson(
   if (error) console.error('[db] deleteFlashcardsForLesson', error.message);
 }
 
-export async function updateFlashcardSRS(
-  supabase: SupabaseClient,
-  cardId: string,
-  updates: { ease: number; interval_days: number; due_at: string; lapses: number }
-): Promise<void> {
-  const { error } = await supabase
-    .from('flashcards')
-    .update(updates)
-    .eq('id', cardId);
-  if (error) console.error('[db] updateFlashcardSRS', error.message);
-}
-
 // ── Questions ─────────────────────────────────────────────────────────────────
 
 export async function getQuestions(
@@ -258,21 +310,6 @@ export async function getQuestions(
     .order('created_at', { ascending: true });
   if (error) { console.error('[db] getQuestions', error.message); return []; }
   return data as Question[];
-}
-
-export async function getAllQuestions(
-  supabase: SupabaseClient,
-  userId: string,
-  sectionId?: string
-): Promise<Question[]> {
-  let query = supabase
-    .from('questions')
-    .select('*, lessons!inner(user_id, section_id)')
-    .eq('lessons.user_id', userId);
-  if (sectionId) query = query.eq('lessons.section_id', sectionId);
-  const { data, error } = await query;
-  if (error) { console.error('[db] getAllQuestions', error.message); return []; }
-  return (data as (Question & { lessons: unknown })[]).map(({ lessons: _l, ...q }) => q as Question);
 }
 
 export async function insertQuestions(
@@ -305,38 +342,12 @@ export async function recordAttempt(
   if (error) console.error('[db] recordAttempt', error.message);
 }
 
-export async function getAttempts(
+// The caller's practice results per section since `since`, aggregated in SQL.
+export async function getSectionStats(
   supabase: SupabaseClient,
-  userId: string,
-  since?: Date
-): Promise<Attempt[]> {
-  let query = supabase
-    .from('attempts')
-    .select('*')
-    .eq('user_id', userId)
-    .order('answered_at', { ascending: false });
-  if (since) query = query.gte('answered_at', since.toISOString());
-  const { data, error } = await query;
-  if (error) { console.error('[db] getAttempts', error.message); return []; }
-  return data as Attempt[];
-}
-
-// ── Textbook search ───────────────────────────────────────────────────────────
-
-export type TextbookChunk = {
-  id: string;
-  content: string;
-  heading: string | null;
-  chapter: string | null;
-  chunk_index: number;
-};
-
-export async function searchTextbook(
-  supabase: SupabaseClient,
-  query: string,
-  limit = 5
-): Promise<TextbookChunk[]> {
-  const { data, error } = await supabase.rpc('search_textbook', { q: query.trim(), limit_n: limit });
-  if (error) { console.error('[db] searchTextbook', error.message); return []; }
-  return (data ?? []) as TextbookChunk[];
+  since: Date
+): Promise<SectionStats[]> {
+  const { data, error } = await supabase.rpc('section_stats', { p_since: since.toISOString() });
+  if (error) { console.error('[db] getSectionStats', error.message); return []; }
+  return data as SectionStats[];
 }
