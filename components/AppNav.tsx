@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState } from 'react';
-import { House, Cards, Plus } from '@phosphor-icons/react';
+import { House, Cards, Plus, UserPlus } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import * as db from '@/lib/db';
 import { getLevelInfo } from '@/lib/gamification';
@@ -18,6 +18,7 @@ const NAV = [
   { href: '/',        label: 'Home',   Icon: House, adminOnly: false },
   { href: '/review',  label: 'Review', Icon: Cards, adminOnly: false },
   { href: '/ingest',  label: 'Add',    Icon: Plus,  adminOnly: true  },
+  { href: '/admin/invites', label: 'Invites', Icon: UserPlus, adminOnly: true },
 ] as const;
 
 export function AppNav() {

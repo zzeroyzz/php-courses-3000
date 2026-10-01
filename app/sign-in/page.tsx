@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { createClient } from '@/utils/supabase/client';
 import { APP_NAME, COURSE_NAME } from '@/lib/course';
 
@@ -79,6 +80,10 @@ export default function SignInPage() {
           >
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
+
+          <Link href="/forgot-password" className="block text-[13px] text-n500 hover:text-fg transition-colors">
+            Forgot password?
+          </Link>
         </form>
       </div>
     </main>

@@ -13,6 +13,7 @@ import {
   type DueCount,
   type SectionStats,
 } from './db-types';
+import type { Invite } from './invites';
 
 // Content tables (sections, lessons, flashcards, questions) are shared: RLS lets
 // every signed-in user read them and only admins write them. Study state
@@ -350,4 +351,28 @@ export async function getSectionStats(
   const { data, error } = await supabase.rpc('section_stats', { p_since: since.toISOString() });
   if (error) { console.error('[db] getSectionStats', error.message); return []; }
   return data as SectionStats[];
+}
+
+// ── Invites (admin only — RLS returns nothing to anyone else) ─────────────────
+
+export async function getInvites(supabase: SupabaseClient): Promise<Invite[]> {
+  const { data, error } = await supabase
+    .from('invites')
+    .select('id, email, label, created_by, created_at, expires_at, revoked_at, used_at, used_by')
+    .order('created_at', { ascending: false });
+  if (error) { console.error('[db] getInvites', error.message); return []; }
+  return data as Invite[];
+}
+
+// Only an unused invite can be revoked; a used one already has an account.
+export async function revokeInvite(supabase: SupabaseClient, inviteId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('invites')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('id', inviteId)
+    .is('used_at', null)
+    .is('revoked_at', null)
+    .select('id');
+  if (error) { console.error('[db] revokeInvite', error.message); return false; }
+  return (data?.length ?? 0) > 0;
 }
