@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Builds supabase/migrations/011_georgia_course_seed.sql from the RealEstateU
-// course sidebar HTML. Seeds every section and lesson with empty source_content;
+// course structure. Seeds every section and lesson with empty source_content;
 // content is pasted lesson by lesson afterwards.
 //
-//   node scripts/build-course-seed.mjs <sidebar.html> [--out <file.sql>]
+//   node scripts/build-course-seed.mjs <structure file> [--out <file.sql>]
 //
-// Sidebar structure this expects:
+// The input may mix two formats, read in document order:
+//
+// 1. Sidebar HTML (lines starting with '<'):
 //   .navigation-chapter  → one section; title in `.chapter p`, sometimes split
 //                          across several <p> ("Chapter 10" + "Georgia Residential
 //                          Landlord" + "Tenant Act") — joined with spaces
@@ -14,7 +16,16 @@
 // Lessons belong to the most recent chapter in document order, so this works
 // whether lessons are nested inside their chapter element or follow it.
 // Lock icons (fa-check / fa-lock-open / fa-lock) are ignored: that is progress
-// on RealEstateU's platform, not ours.
+// on RealEstateU's platform, not ours. <sup> tails are stripped.
+//
+// 2. Outline lines, one chapter per line:
+//      Chapter N — Title: N.0 First lesson / N.1 Second lesson / Chapter N - Quiz
+//    Lessons are separated by " / ", but some titles contain " / " themselves
+//    ("18.3 Tax Rates / Calculating Property Taxes"). Every real lesson is
+//    numbered, so an unnumbered fragment (other than the chapter quiz) is
+//    rejoined onto the previous title.
+//    A trailing line such as "Final Exam Instructions (single lesson, …)" is a
+//    one-lesson section; the parenthetical is dropped.
 //
 // Re-running is safe: inserts are ON CONFLICT DO NOTHING, so a newer sidebar
 // adds missing rows without touching pasted content or edited weights.
@@ -27,6 +38,14 @@ const EXPECTED_CHAPTERS = 35;
 // Georgia statute chapters: depth comes from pasted primary source (Commission
 // rules, O.C.G.A.), never from the model.
 const STATUTE_CHAPTERS = new Set([2, 3, 10, 17, 24]);
+
+// Document examples: forms, exhibits and sample documents with little prose.
+// Generating drills from a blank deed form gives junk, so these are opt-in.
+//   - "X Example" / "Example of a X" followed by "X Review" / "X Case Review"
+//   - any "Example of …" or "… Example"
+//   - named forms, exhibits and pamphlets
+// A "… Review" lesson is always prose, even "FHA Loan Contingency Exhibit Review".
+const DOCUMENT_TITLE = /\b(exhibit|pamphlet|form \d+|loan application|closing disclosure|loan estimate|disclosure of information|know your rights)\b/i;
 
 const DEFAULT_MIX = { factual: 0.6, scenario: 0.4, calculation: 0 };
 const MATH_MIX = { factual: 0.15, scenario: 0.15, calculation: 0.7 };
@@ -48,24 +67,66 @@ if (!htmlPath) {
 const clean = (s) => s.replace(/\s+/g, ' ').trim();
 const slugify = (s) => s.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
-const root = parse(readFileSync(htmlPath, 'utf8'));
 const chapters = [];
 const problems = [];
+const notes = [];   // non-fatal: printed for review
 
-for (const el of root.querySelectorAll('.navigation-chapter, .navigation-lesson')) {
-  if (el.classList.contains('navigation-chapter')) {
-    const parts = el.querySelectorAll('.chapter p').map((p) => clean(p.text)).filter(Boolean);
-    const raw = clean(parts.join(' '));
-    chapters.push({ ...classifyChapter(raw), raw, lessons: [] });
-  } else {
-    const titleEl = el.querySelector('.lesson-title');
-    const raw = titleEl ? clean(titleEl.text) : '';
-    const current = chapters.at(-1);
-    if (!raw) { problems.push('lesson with no .lesson-title'); continue; }
-    if (!current) { problems.push(`lesson before any chapter: "${raw}"`); continue; }
-    current.lessons.push(raw);
+function parseHtml(html) {
+  const root = parse(html);
+  for (const sup of root.querySelectorAll('sup')) sup.remove();
+  for (const el of root.querySelectorAll('.navigation-chapter, .navigation-lesson')) {
+    if (el.classList.contains('navigation-chapter')) {
+      const parts = el.querySelectorAll('.chapter p').map((p) => clean(p.text)).filter(Boolean);
+      const raw = clean(parts.join(' '));
+      chapters.push({ ...classifyChapter(raw), raw, lessons: [] });
+    } else {
+      const titleEl = el.querySelector('.lesson-title');
+      const raw = titleEl ? clean(titleEl.text) : '';
+      const current = chapters.at(-1);
+      if (!raw) { problems.push('lesson with no .lesson-title'); continue; }
+      if (!current) { problems.push(`lesson before any chapter: "${raw}"`); continue; }
+      current.lessons.push(raw);
+    }
   }
 }
+
+const OUTLINE_CHAPTER = /^Chapter\s+(\d+)\s+[—–-]\s+(.+?):\s+(?=\d+\.\d)(.*)$/;
+const QUIZ_ITEM = /^Chapter\s+\d+\s*-\s*Quiz$/i;
+
+function parseOutlineChapter(n, title, rest) {
+  const lessons = [];
+  for (const item of rest.split(' / ').map(clean).filter(Boolean)) {
+    if (/^\d+\.\d/.test(item) || QUIZ_ITEM.test(item) || lessons.length === 0) {
+      lessons.push(item);
+    } else {
+      const joined = `${lessons.pop()} / ${item}`;
+      notes.push(`chapter ${n}: rejoined title "${joined}"`);
+      lessons.push(joined);
+    }
+  }
+  const raw = `Chapter ${n} ${title}`;
+  chapters.push({ ...classifyChapter(raw), raw, lessons });
+}
+
+let htmlBuffer = [];
+const flushHtml = () => { if (htmlBuffer.length) parseHtml(htmlBuffer.join('\n')); htmlBuffer = []; };
+
+for (const line of readFileSync(htmlPath, 'utf8').split('\n')) {
+  const t = line.trim();
+  if (t.startsWith('<')) { htmlBuffer.push(t); continue; }
+  flushHtml();
+  if (!t) continue;
+  const m = t.match(OUTLINE_CHAPTER);
+  if (m) { parseOutlineChapter(Number(m[1]), clean(m[2]), m[3]); continue; }
+  const single = t.match(/^(.+?)\s*(\(.*\))?$/);
+  if (single && /final\s+exam/i.test(single[1])) {
+    const name = clean(single[1]);
+    chapters.push({ ...classifyChapter(name), raw: name, lessons: [name] });
+    continue;
+  }
+  problems.push(`unrecognised line: "${t.slice(0, 80)}"`);
+}
+flushHtml();
 
 function classifyChapter(raw) {
   const m = raw.match(/^Chapter\s+(\d+)\s*[:\-–—]?\s*(.*)$/i);
@@ -81,23 +142,23 @@ function classifyChapter(raw) {
 
 // ── Lessons: number, title, kind ──────────────────────────────────────────────
 
-const LESSON_NUM = /^(\d+\.\d+[a-z]?)\b[\s.:\-–—]*(.*)$/i;
+// Also accepts the occasional "28.3.a", normalised to "28.3a".
+const LESSON_NUM = /^(\d+\.\d+)\.?([a-z])?(?![\w.])[\s.:\-–—]*(.*)$/i;
 
 for (const ch of chapters) {
   const parsed = ch.lessons.map((raw) => {
     const m = raw.match(LESSON_NUM);
-    return m ? { raw, number: m[1].toLowerCase(), title: m[2] || raw } : { raw, number: null, title: raw };
+    if (!m) return { raw, number: null, title: raw };
+    const number = `${m[1]}${m[2] ?? ''}`.toLowerCase();
+    if (raw.startsWith(`${m[1]}.${m[2]}`)) notes.push(`normalised lesson number "${m[1]}.${m[2]}" -> "${number}"`);
+    return { raw, number, title: m[3] || raw };
   });
 
   ch.rows = parsed.map((l, i) => {
     let kind = 'prose';
-    if (/infographic/i.test(l.title)) kind = 'infographic';
-    else if (/\bquiz\b/i.test(l.title) || ch.kind === 'final') kind = 'quiz';
-    else {
-      // A document example is followed by "<same title> Review".
-      const next = parsed[i + 1];
-      if (next && normalise(next.title) === `${normalise(l.title)} review`) kind = 'document';
-    }
+    if (/\b(infographic|diagram)\b/i.test(l.title)) kind = 'infographic';
+    else if (/\bquiz\b/i.test(l.title)) kind = 'quiz';
+    else if (isDocument(l, parsed[i + 1])) kind = 'document';
 
     // Unnumbered lessons get a stable synthetic key so re-runs stay idempotent
     // (UNIQUE (section_id, lesson_number) ignores NULLs). The UI only displays
@@ -119,6 +180,20 @@ for (const ch of chapters) {
 
 function normalise(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+
+function documentBase(title) {
+  return normalise(title).replace(/^example of (a |an )?/, '').replace(/ example$/, '');
+}
+
+function isDocument(lesson, next) {
+  const t = lesson.title;
+  if (/\breview$/i.test(t)) return false;   // the Review lesson after a document is prose
+  if (/^example of\b/i.test(t) || /\bexample$/i.test(t) || DOCUMENT_TITLE.test(t)) return true;
+  if (!next) return false;
+  const nextBase = normalise(next.title).replace(/ (case )?review$/, '');
+  return /\breview$/i.test(next.title) && nextBase === documentBase(t);
 }
 
 // ── Validate ──────────────────────────────────────────────────────────────────
@@ -166,6 +241,9 @@ for (const c of chapters) {
 }
 const docs = chapters.flatMap((c) => c.rows.filter((r) => r.kind === 'document').map((r) => `${r.number} ${r.title}`));
 if (docs.length) console.log(`\nDocument examples (generation off by default):\n  ${docs.join('\n  ')}`);
+const images = chapters.flatMap((c) => c.rows.filter((r) => r.kind === 'infographic').map((r) => `${r.number} ${r.title}`));
+console.log(`\n${images.length} image-only lessons (infographics / diagrams)`);
+if (notes.length) console.log(`\nNotes:\n  ${notes.join('\n  ')}`);
 
 if (problems.length) {
   console.error(`\n✗ ${problems.length} problem(s) — no SQL written:\n  ${problems.join('\n  ')}`);
