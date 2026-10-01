@@ -166,7 +166,6 @@ for (const ch of chapters) {
     let number = l.number;
     if (!number) {
       number = kind === 'quiz' && ch.number != null ? `${ch.number}.quiz` : `${ch.number ?? ch.slug}.${slugify(l.title)}`;
-      if (ch.kind === 'chapter' && kind !== 'quiz') problems.push(`unnumbered lesson in ${ch.slug}: "${l.raw}"`);
     }
     return { number, title: l.title, kind, sort: (i + 1) * 10 };
   });
@@ -206,6 +205,22 @@ const dupSlugs = chapters.map((c) => c.slug).filter((s, i, a) => a.indexOf(s) !=
 for (const s of new Set(dupSlugs)) problems.push(`duplicate chapter ${s}`);
 for (const c of chapters) if (c.rows.length === 0) problems.push(`${c.slug} has no lessons`);
 
+// Every lesson in a numbered chapter is either numbered with that chapter's own
+// N.M (N.Ma, N.Mb …) or is exactly that chapter's quiz. Anything else is a
+// fragment that slipped through the " / " rejoin, or a misfiled lesson — a
+// phantom row that would otherwise be buried in a ~400-row seed.
+for (const c of chapters.filter((ch) => ch.kind === 'chapter')) {
+  const quiz = new RegExp(`^Chapter\\s+${c.number}\\s*-\\s*Quiz$`, 'i');
+  let quizzes = 0;
+  for (const raw of c.lessons) {
+    const m = raw.match(LESSON_NUM);
+    if (m && Number(m[1].split('.')[0]) === c.number) continue;
+    if (quiz.test(raw)) { quizzes++; continue; }
+    problems.push(`${c.slug}: not numbered ${c.number}.M and not its quiz: "${raw}"`);
+  }
+  if (quizzes !== 1) problems.push(`${c.slug}: expected exactly 1 chapter quiz, found ${quizzes}`);
+}
+
 // ── Weights ───────────────────────────────────────────────────────────────────
 // Course-completion weights: each chapter's share of the course's countable
 // lessons. Infographics are image-only and don't count; Orientation and the
@@ -244,6 +259,10 @@ if (docs.length) console.log(`\nDocument examples (generation off by default):\n
 const images = chapters.flatMap((c) => c.rows.filter((r) => r.kind === 'infographic').map((r) => `${r.number} ${r.title}`));
 console.log(`\n${images.length} image-only lessons (infographics / diagrams)`);
 if (notes.length) console.log(`\nNotes:\n  ${notes.join('\n  ')}`);
+
+if (!problems.length) {
+  console.log(`\n✓ every lesson in Chapters 1–${EXPECTED_CHAPTERS} is numbered N.M or is its chapter quiz (one quiz each)`);
+}
 
 if (problems.length) {
   console.error(`\n✗ ${problems.length} problem(s) — no SQL written:\n  ${problems.join('\n  ')}`);
