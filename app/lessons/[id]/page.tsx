@@ -7,6 +7,8 @@ import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
 import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
+import { DepthLayer, LessonSource, findInSource, revealRange } from '@/components/LessonReading';
+import type { SourceLayout } from '@/components/LessonReading';
 import { startGeneration } from '@/lib/generation-client';
 import { useNow } from '@/lib/use-now';
 import { getViewer } from '@/lib/viewer';
@@ -24,108 +26,6 @@ const TYPE_LABEL: Record<QuestionType, string> = {
   scenario: 'Scenario',
   calculation: 'Calc',
 };
-
-// ── Source parser ─────────────────────────────────────────────────────────────
-
-type Block =
-  | { type: 'heading'; text: string }
-  | { type: 'sub'; text: string }
-  | { type: 'list'; items: string[] }
-  | { type: 'note'; text: string }
-  | { type: 'paragraph'; text: string };
-
-function parseSource(text: string): Block[] {
-  const sections = text.split(/\n{2,}/);
-  const blocks: Block[] = [];
-  const bulletRe = /^[-•*]\s|^\d+[.)]\s/;
-
-  for (const section of sections) {
-    const lines = section.split('\n').map((l) => l.trim()).filter(Boolean);
-    if (!lines.length) continue;
-
-    if (lines.length === 1 && lines[0].length <= 80 && lines[0].endsWith(':')) {
-      blocks.push({ type: 'heading', text: lines[0] });
-      continue;
-    }
-
-    if (lines.length === 1 && lines[0].length <= 60 && !bulletRe.test(lines[0])) {
-      blocks.push({ type: 'sub', text: lines[0] });
-      continue;
-    }
-
-    if (lines[0].toLowerCase().startsWith('note:') || lines[0].toLowerCase().startsWith('important:')) {
-      blocks.push({ type: 'note', text: lines.join(' ') });
-      continue;
-    }
-
-    const bulletLines = lines.filter((l) => bulletRe.test(l));
-    if (bulletLines.length >= 2 && bulletLines.length / lines.length >= 0.5) {
-      blocks.push({ type: 'list', items: lines.map((l) => l.replace(/^[-•*]\s*|^\d+[.)]\s*/, '')) });
-      continue;
-    }
-
-    blocks.push({ type: 'paragraph', text: lines.join(' ') });
-  }
-
-  return blocks;
-}
-
-// ── Anchor matching ───────────────────────────────────────────────────────────
-// source_anchor is meant to be verbatim, but models drift on whitespace, curly
-// quotes and dashes, and the rendered source joins lines and strips bullets.
-// Match on a normalised form and map the hit back to DOM text positions.
-
-function normChar(c: string): string {
-  if (c === '‘' || c === '’') return "'";
-  if (c === '“' || c === '”') return '"';
-  if (c === '–' || c === '—') return '-';
-  return c.toLowerCase();
-}
-
-function normalise(s: string): string {
-  return Array.from(s).map(normChar).join('').replace(/\s+/g, ' ').replace(/^[-•*]\s*/, '').trim();
-}
-
-function findInSource(root: HTMLElement, anchor: string): Range | null {
-  let text = '';
-  const map: { node: Text; offset: number }[] = [];
-  let lastSpace = true;
-
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  while (walker.nextNode()) {
-    const node = walker.currentNode as Text;
-    for (let i = 0; i < node.data.length; i++) {
-      let c = normChar(node.data[i]);
-      if (/\s/.test(c)) {
-        if (lastSpace) continue;
-        c = ' ';
-        lastSpace = true;
-      } else {
-        lastSpace = false;
-      }
-      text += c;
-      map.push({ node, offset: i });
-    }
-    // Separate text nodes (blocks, list items) with a space.
-    if (!lastSpace) { text += ' '; map.push({ node, offset: node.data.length }); lastSpace = true; }
-  }
-
-  const needle = normalise(anchor);
-  // Whole quote first, then progressively shorter prefixes.
-  for (const len of [needle.length, 60, 30]) {
-    const probe = needle.slice(0, len).trim();
-    if (probe.length < 15 && probe.length < needle.length) continue;
-    const idx = text.indexOf(probe);
-    if (idx === -1) continue;
-    const start = map[idx];
-    const end = map[Math.min(idx + probe.length - 1, map.length - 1)];
-    const range = document.createRange();
-    range.setStart(start.node, start.offset);
-    range.setEnd(end.node, Math.min(end.offset + 1, end.node.data.length));
-    return range;
-  }
-  return null;
-}
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
@@ -172,7 +72,15 @@ export default function LessonPage() {
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(searchParams.get('anchor'));
   const [anchorMiss, setAnchorMiss] = useState<string | null>(null);
 
+  // How the course text is contained. 'box' unless ?source=collapse — a
+  // temporary switch so both candidates can be compared on real lessons.
+  const sourceLayout: SourceLayout = searchParams.get('source') === 'collapse' ? 'collapse' : 'box';
+  // A collapsed preview has to be open before a jump can show the quote, so an
+  // incoming ?anchor starts it expanded.
+  const [sourceExpanded, setSourceExpanded] = useState(sourceLayout === 'collapse' && !!searchParams.get('anchor'));
+
   const sourceRef = useRef<HTMLDivElement>(null);
+  const sourceScrollerRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
   async function reloadContent() {
@@ -255,18 +163,20 @@ export default function LessonPage() {
       const sel = window.getSelection();
       sel?.removeAllRanges();
       sel?.addRange(range);
-      range.startContainer.parentElement?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // In the box layout the quote can be inside the box's own scroll area.
+      revealRange(range, sourceLayout === 'box' && !sourceExpanded ? sourceScrollerRef.current : null);
     } else {
       setAnchorMiss(pendingAnchor);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
     setPendingAnchor(null);
-  }, [pendingAnchor, tab, lesson]);
+  }, [pendingAnchor, tab, lesson, sourceExpanded, sourceLayout]);
 
   function jumpToSource(anchor: string | null) {
     if (!anchor) return;
     setPendingAnchor(anchor);
     setTab('read');
+    if (sourceLayout === 'collapse') setSourceExpanded(true);
   }
 
   async function handleCardAnswer(correct: boolean) {
@@ -475,18 +385,26 @@ export default function LessonPage() {
                 )}
 
                 {/* Course text — the primary body and the only anchor target */}
-                <div ref={sourceRef} className="space-y-4">
-                  <SourceBlocks text={lesson.source_content} />
-                </div>
-
-                <DepthLayer
-                  lesson={lesson}
-                  section={section}
-                  isAdmin={isAdmin}
-                  state={depthState}
-                  error={depthError}
-                  onGenerate={handleGenerateDepth}
+                <LessonSource
+                  text={lesson.source_content}
+                  layout={sourceLayout}
+                  expanded={sourceExpanded}
+                  onExpandedChange={setSourceExpanded}
+                  contentRef={sourceRef}
+                  scrollerRef={sourceScrollerRef}
+                  hasDepth={!!lesson.depth_content}
                 />
+
+                <div id="going-deeper" style={{ scrollMarginTop: '16px' }}>
+                  <DepthLayer
+                    lesson={lesson}
+                    section={section}
+                    isAdmin={isAdmin}
+                    state={depthState}
+                    error={depthError}
+                    onGenerate={handleGenerateDepth}
+                  />
+                </div>
 
                 {!completedAt ? (
                   <div className="space-y-2">
@@ -708,152 +626,6 @@ export default function LessonPage() {
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
-
-function SourceBlocks({ text }: { text: string }) {
-  return (
-    <>
-      {parseSource(text).map((block, i) => {
-        if (block.type === 'heading') {
-          return (
-            <h3 key={i} className="text-[15px] font-medium text-fg mt-2 tracking-[-0.01em]">
-              {block.text}
-            </h3>
-          );
-        }
-        if (block.type === 'sub') {
-          return (
-            <p key={i} className="text-[13px] font-medium" style={{ color: 'var(--color-accent-md)' }}>
-              {block.text}
-            </p>
-          );
-        }
-        if (block.type === 'note') {
-          return (
-            <div
-              key={i}
-              className="rounded-r-lg px-4 py-3"
-              style={{
-                background: 'var(--color-n900)',
-                boxShadow: 'inset 2px 0 0 var(--color-accent)',
-              }}
-            >
-              <p className="text-[14px] text-n400 leading-relaxed">{block.text}</p>
-            </div>
-          );
-        }
-        if (block.type === 'list') {
-          return (
-            <ul key={i} className="space-y-1.5">
-              {block.items.map((item, j) => (
-                <li key={j} className="flex items-start gap-3 text-[16px] text-fg leading-[1.75]">
-                  <span
-                    className="mt-2.5 w-1 h-1 rounded-sm shrink-0"
-                    style={{ background: 'var(--color-accent)' }}
-                  />
-                  {item}
-                </li>
-              ))}
-            </ul>
-          );
-        }
-        return (
-          <p key={i} className="text-[16px] text-fg leading-[1.75]" style={{ textWrap: 'pretty' }}>{block.text}</p>
-        );
-      })}
-    </>
-  );
-}
-
-// "Going deeper": generated, unsourced, never drilled. Set apart from the course
-// text by a sunk background, a muted left rule and an explicit label.
-function DepthLayer({
-  lesson, section, isAdmin, state, error, onGenerate,
-}: {
-  lesson: Lesson;
-  section: Section | null;
-  isAdmin: boolean;
-  state: 'idle' | 'working' | 'error';
-  error: string | null;
-  onGenerate: () => void;
-}) {
-  if (section && !section.allow_generated_depth) {
-    // Georgia statute chapters: depth comes from primary sources, not the model.
-    return isAdmin ? (
-      <p className="text-[12px] text-n600 leading-relaxed">
-        Georgia law chapter — generated depth is off here. Deeper reading should come from the
-        Commission rules and O.C.G.A. text, not generated content.
-      </p>
-    ) : null;
-  }
-
-  if (!lesson.depth_content) {
-    if (!isAdmin) return null;
-    return (
-      <div
-        className="rounded-lg px-4 py-4 space-y-2"
-        style={{ border: '1px dashed var(--color-divider)' }}
-      >
-        <p className="text-[13px] text-n500 leading-relaxed">
-          Add a generated &ldquo;Going deeper&rdquo; section beneath this lesson. It&rsquo;s marked as
-          unsourced and never goes on the review schedule.
-        </p>
-        <button onClick={onGenerate} disabled={state === 'working'} className="btn btn-secondary">
-          {state === 'working' ? 'Generating…' : 'Generate deeper reading'}
-        </button>
-        {state === 'error' && error && <p className="text-[12px] text-n500">{error}</p>}
-      </div>
-    );
-  }
-
-  return (
-    <section
-      className="rounded-r-lg px-5 py-5 space-y-4"
-      style={{
-        background: 'var(--color-surface-sunk)',
-        boxShadow: 'inset 2px 0 0 var(--color-n700)',
-      }}
-    >
-      <div className="space-y-1">
-        <p className="text-[11px] font-medium text-n500 uppercase tracking-wide">Going deeper</p>
-        <p className="text-[12px] text-n600">
-          Generated · not from the course · not on your review schedule
-        </p>
-      </div>
-      <div className="space-y-3 text-n400 [&_p]:text-[15px] [&_p]:leading-[1.75] [&_li]:text-[15px] [&_h3]:text-n300">
-        {parseSource(lesson.depth_content).map((block, i) => {
-          if (block.type === 'heading' || block.type === 'sub') {
-            return <h3 key={i} className="text-[14px] font-medium mt-1">{block.text.replace(/:$/, '')}</h3>;
-          }
-          if (block.type === 'list') {
-            return (
-              <ul key={i} className="space-y-1">
-                {block.items.map((item, j) => (
-                  <li key={j} className="flex items-start gap-3 leading-[1.75]">
-                    <span className="mt-2.5 w-1 h-1 rounded-sm shrink-0" style={{ background: 'var(--color-n600)' }} />
-                    {item}
-                  </li>
-                ))}
-              </ul>
-            );
-          }
-          return <p key={i} style={{ textWrap: 'pretty' }}>{block.text}</p>;
-        })}
-      </div>
-      {isAdmin && (
-        <div className="flex items-center gap-3">
-          <button
-            onClick={onGenerate}
-            disabled={state === 'working'}
-            className="text-[12px] text-n600 hover:text-n400 transition-colors disabled:opacity-40"
-          >
-            {state === 'working' ? 'Regenerating…' : 'Regenerate'}
-          </button>
-          {state === 'error' && error && <span className="text-[12px] text-n500">{error}</span>}
-        </div>
-      )}
-    </section>
-  );
-}
 
 function DrillState({
   status, kind, isAdmin, lessonId, generationChunk, sectionSlug, onGenerate, onStopped, hasDrills,
