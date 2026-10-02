@@ -7,12 +7,16 @@ import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
 import { CardSkeleton } from '@/components/Skeleton';
+import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
+import { startGeneration } from '@/lib/generation-client';
+import { useNow } from '@/lib/use-now';
 import {
   contentStatus,
   countsTowardProgress,
   displayLessonNumber,
+  isResumable,
   sectionLabel,
 } from '@/lib/db-types';
 import type { ContentStatus, Section, LessonSummary } from '@/lib/db-types';
@@ -31,10 +35,9 @@ export default function SectionPage() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  // Regenerate flow: confirm (with the number of students who'd lose progress), then run
+  // Regenerate / start over: confirm (with the number of students who'd lose progress), then run
   const [confirming, setConfirming] = useState<{ lessonId: string; learners: number } | null>(null);
-  const [regenerating, setRegenerating] = useState<string | null>(null);
-  const [regenError, setRegenError] = useState<{ lessonId: string; message: string } | null>(null);
+  const [actionError, setActionError] = useState<{ lessonId: string; message: string } | null>(null);
 
   const reloadLessons = useCallback(async (sectionId: string) => {
     setLessons(await db.getLessonSummaries(supabase, sectionId));
@@ -63,37 +66,43 @@ export default function SectionPage() {
     })();
   }, [supabase, router, slug]);
 
+  // Follow generation live: every status change is a write to a lessons row.
+  useEffect(() => {
+    if (!section) return;
+    const channel = supabase
+      .channel(`section-lessons-${section.id}`)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'lessons', filter: `section_id=eq.${section.id}` },
+        () => { reloadLessons(section.id); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [supabase, section, reloadLessons]);
+
   async function askRegenerate(lesson: LessonSummary) {
-    setRegenError(null);
+    setActionError(null);
     const learners = await db.getLessonLearnerCount(supabase, lesson.id);
     setConfirming({ lessonId: lesson.id, learners });
   }
 
-  // chunkFrom > 0 resumes a failed generation without deleting what survived.
-  async function runGenerate(lesson: LessonSummary, chunkFrom = 0) {
+  // reset: start over (deletes earlier output). Otherwise resume from the
+  // chunk where it failed or was stopped, keeping what it saved.
+  async function runGenerate(lesson: LessonSummary, reset: boolean) {
     if (!section) return;
     setConfirming(null);
-    setRegenError(null);
-    setRegenerating(lesson.id);
-    setLessons((prev) => prev.map((l) => l.id === lesson.id ? { ...l, generated_at: null, generation_chunk: null } : l));
-    try {
-      const res = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lessonId: lesson.id, chunkFrom }),
-      });
-      const json = await res.json() as { ok?: boolean; error?: string };
-      if (!res.ok || json.error) throw new Error(json.error ?? 'Generation failed');
-    } catch (err) {
-      setRegenError({ lessonId: lesson.id, message: err instanceof Error ? err.message : 'Generation failed' });
-    } finally {
-      setRegenerating(null);
-      await reloadLessons(section.id);
-    }
+    setActionError(null);
+    const ok = await startGeneration(supabase, lesson.id, { reset, chunkFrom: lesson.generation_chunk ?? 0 });
+    if (!ok) setActionError({ lessonId: lesson.id, message: 'Couldn\u2019t start generation. Try again.' });
+    await reloadLessons(section.id);
   }
 
+  const anyRunning = lessons.some((l) => {
+    const st = contentStatus(l);
+    return st === 'generating' || st === 'cancelling';
+  });
+  const now = useNow(anyRunning);
+
   const countable = lessons.filter(countsTowardProgress);
-  const available = countable.filter((l) => contentStatus(l) === 'ready');
+  const available = countable.filter((l) => contentStatus(l, now) === 'ready');
   const completedCount = available.filter((l) => completedIds.has(l.id)).length;
   const notAddedCount = countable.filter((l) => !l.has_source).length;
 
@@ -150,13 +159,13 @@ export default function SectionPage() {
               )}
 
               {lessons.map((lesson) => {
-                const content = contentStatus(lesson);
+                const content = contentStatus(lesson, now);
                 const status: RowStatus = content === 'ready' && completedIds.has(lesson.id) ? 'completed' : content;
                 const due = dueCounts[lesson.id] ?? 0;
                 const number = displayLessonNumber(lesson);
-                const isRegenerating = regenerating === lesson.id;
                 const isConfirming = confirming?.lessonId === lesson.id;
-                const error = regenError?.lessonId === lesson.id ? regenError.message : null;
+                const error = actionError?.lessonId === lesson.id ? actionError.message : null;
+                const refresh = () => section && reloadLessons(section.id);
 
                 // Empty lessons: dimmed and inert for students; a paste link for admins.
                 if (content === 'empty') {
@@ -234,8 +243,7 @@ export default function SectionPage() {
                             <div className="w-px h-4" style={{ background: 'var(--color-divider)' }} />
                             <button
                               onClick={() => askRegenerate(lesson)}
-                              disabled={isRegenerating}
-                              className="flex-1 text-center py-2 text-[12px] text-n600 hover:text-fg transition-colors disabled:opacity-40"
+                              className="flex-1 text-center py-2 text-[12px] text-n600 hover:text-fg transition-colors"
                             >
                               Regenerate
                             </button>
@@ -254,35 +262,43 @@ export default function SectionPage() {
                         </p>
                         <div className="flex gap-2">
                           <button onClick={() => setConfirming(null)} className="btn btn-secondary flex-1">Cancel</button>
-                          <button onClick={() => runGenerate(lesson)} className="btn btn-primary flex-1">Regenerate</button>
+                          <button onClick={() => runGenerate(lesson, true)} className="btn btn-primary flex-1">Regenerate</button>
                         </div>
                       </div>
                     )}
 
-                    {status === 'generating' && (
-                      <div className="px-4 py-2 flex items-center gap-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
+                    {(status === 'generating' || status === 'cancelling') && (
+                      <div className="px-4 py-2 flex flex-wrap items-center gap-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
                         <Spinner />
-                        <p className="text-[12px] text-n600">{isRegenerating ? 'Regenerating…' : 'Generating…'}</p>
+                        <p className="text-[12px] text-n600 flex-1">{status === 'cancelling' ? 'Stopping…' : 'Generating…'}</p>
+                        {isAdmin && status === 'generating' && (
+                          <StopGeneration lessonId={lesson.id} onStopped={refresh} />
+                        )}
                       </div>
                     )}
 
-                    {status === 'failed' && (
-                      <div className="px-4 py-2 flex items-center justify-between gap-3" style={{ borderTop: '1px solid var(--color-divider)' }}>
+                    {(isResumable(status as ContentStatus) || status === 'stalled') && (
+                      <div className="px-4 py-2 space-y-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
                         <p className="text-[12px] text-n600">
-                          {isAdmin ? `Generation stopped at part ${(lesson.generation_chunk ?? 0) + 1}.` : 'Study materials are being prepared.'}
+                          {!isAdmin
+                            ? 'Study materials are being prepared.'
+                            : status === 'cancelled'
+                            ? `Stopped before part ${(lesson.generation_chunk ?? 0) + 1}. What was generated is kept.`
+                            : status === 'failed'
+                            ? `Generation failed at part ${(lesson.generation_chunk ?? 0) + 1}.`
+                            : 'Generation isn\u2019t running. It may have timed out.'}
                         </p>
-                        {isAdmin && (
-                          <div className="flex gap-3 shrink-0">
-                            <button
-                              onClick={() => runGenerate(lesson, lesson.generation_chunk ?? 0)}
-                              className="text-[12px]"
-                              style={{ color: 'var(--color-accent-md)' }}
-                            >
-                              Resume
-                            </button>
+                        {isAdmin && !isConfirming && (
+                          <div className="flex flex-wrap gap-x-4 gap-y-2 items-center">
+                            {lesson.generation_chunk != null && (
+                              <button onClick={() => runGenerate(lesson, false)} className="text-[12px]" style={{ color: 'var(--color-accent-md)' }}>
+                                Resume
+                              </button>
+                            )}
                             <button onClick={() => askRegenerate(lesson)} className="text-[12px] text-n600 hover:text-fg">
-                              Start over
+                              {lesson.generation_chunk != null ? 'Start over' : 'Generate'}
                             </button>
+                            <ClearLesson lessonId={lesson.id} onCleared={refresh} />
                           </div>
                         )}
                       </div>
@@ -307,7 +323,10 @@ export default function SectionPage() {
 const STATUS_LABEL: Record<RowStatus, string> = {
   empty: 'Not added',
   generating: 'Generating',
-  failed: 'Stopped',
+  cancelling: 'Stopping',
+  cancelled: 'Stopped',
+  failed: 'Failed',
+  stalled: 'Not running',
   ready: 'Ready',
   completed: 'Done',
 };
@@ -316,7 +335,10 @@ function StatusTag({ status, kind }: { status: RowStatus; kind: LessonSummary['k
   const styles: Record<RowStatus, React.CSSProperties> = {
     empty:      { background: 'transparent', color: 'var(--color-n700)', border: '1px solid var(--color-divider)' },
     generating: { background: 'var(--color-accent-dk)', color: 'var(--color-accent-md)', border: 'none' },
+    cancelling: { background: 'var(--color-accent-dk)', color: 'var(--color-accent-md)', border: 'none' },
+    cancelled:  { background: 'transparent', color: 'var(--color-n500)', border: '1px solid var(--color-divider)' },
     failed:     { background: 'transparent', color: 'var(--color-n500)', border: '1px solid var(--color-divider)' },
+    stalled:    { background: 'transparent', color: 'var(--color-n500)', border: '1px solid var(--color-divider)' },
     ready:      { background: 'var(--color-accent-dk)', color: 'var(--color-accent-md)', border: 'none' },
     completed:  { background: 'var(--color-n900)', color: 'var(--color-n500)', border: 'none' },
   };

@@ -5,9 +5,11 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { CheckCircle } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
+import { StopGeneration } from '@/components/GenerationControls';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
-import { displayLessonNumber, sectionLabel } from '@/lib/db-types';
+import { startGeneration } from '@/lib/generation-client';
+import { contentStatus, displayLessonNumber, sectionLabel } from '@/lib/db-types';
 import type { Lesson, LessonSummary, Section } from '@/lib/db-types';
 
 type Step = 'form' | 'saving' | 'generating' | 'done' | 'error';
@@ -43,12 +45,14 @@ function Ingest() {
   const [lessonId, setLessonId] = useState('');
   const [sourceContent, setSourceContent] = useState('');
 
+  // Latest copy of the lesson row being generated, fed by Realtime. Its
+  // status is derived (contentStatus), so a run that dies shows up as
+  // 'stalled' without any client-side timeout.
+  const genRowRef = useRef<LessonSummary | null>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function cleanup() {
     if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
-    if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
   }
 
   useEffect(() => {
@@ -98,36 +102,60 @@ function Ingest() {
     if (lesson.kind === 'document') { setStep('done'); return; }
 
     setStep('generating');
+    genRowRef.current = null;
 
     const channel = supabase
       .channel(`ingest-gen-${lesson.id}`)
       .on(
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'lessons', filter: `id=eq.${lesson.id}` },
-        (payload) => {
-          const row = payload.new as Lesson;
-          if (row.generated_at) { cleanup(); setStep('done'); }
-          else if (row.generation_chunk != null) {
-            cleanup();
-            setErrorMsg('Generation stopped partway. Your source is saved; resume it from the chapter page.');
-            setStep('done');
-          }
-        }
+        (payload) => { genRowRef.current = payload.new as Lesson; evaluate(); }
       )
       .subscribe();
     channelRef.current = channel;
 
-    timeoutRef.current = setTimeout(() => {
+    const started = await startGeneration(supabase, lesson.id, { reset: true });
+    if (!started) {
       cleanup();
-      setErrorMsg('Generation is taking longer than expected. Your source is saved — check the lesson in a moment.');
+      setErrorMsg('Your source is saved, but generation didn\u2019t start. Start it from the chapter page.');
       setStep('done');
-    }, 3 * 60 * 1000);
+      return;
+    }
+    // The subscription may not have been live for the first write; read the
+    // row once so a run that dies silently still surfaces as 'stalled'.
+    const row = await db.getLessonById(supabase, lesson.id);
+    if (row && !genRowRef.current) { genRowRef.current = row; evaluate(); }
+  }
 
-    fetch('/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lessonId: lesson.id }),
-    }).catch(() => {});
+  // Act on the generation's derived status. Called when the row changes and
+  // on a timer, since 'stalled' means "no news for too long".
+  function evaluate() {
+    const row = genRowRef.current;
+    if (!row) return;
+    const status = contentStatus(row);
+    const finish = (msg: string | null) => { cleanup(); genRowRef.current = null; setErrorMsg(msg); setStep('done'); };
+    if (status === 'ready') finish(null);
+    else if (status === 'cancelled') finish('Stopped. What was generated so far is kept; you can resume it from the chapter page.');
+    else if (status === 'failed') finish('Generation failed partway. Your source is saved; resume it from the chapter page.');
+    else if (status === 'stalled') finish('Generation stopped responding. Your source is saved; restart it from the chapter page.');
+  }
+
+  useEffect(() => {
+    if (step !== 'generating') return;
+    const id = setInterval(evaluate, 10_000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
+  // "Stop and clear": the paste is undone server-side. Go back to the form with
+  // the text still in the box, so it can be saved into the right lesson.
+  function handleStopped(mode: 'keep' | 'discard') {
+    if (mode === 'keep') return;   // the 'cancelled' status arrives over Realtime
+    cleanup();
+    genRowRef.current = null;
+    setLessons((prev) => prev.map((l) => l.id === lessonId ? { ...l, has_source: false } : l));
+    setErrorMsg('Cleared. Your text is still below. Pick the right chapter and lesson, then save again.');
+    setStep('error');
   }
 
   function pasteNext() {
@@ -217,17 +245,23 @@ function Ingest() {
 
               <div className="field">
                 <label>Lesson</label>
-                <select
-                  value={lesson.id}
-                  onChange={(e) => setLessonId(e.target.value)}
-                  disabled={!isActive}
-                  className="input"
-                  style={{ appearance: 'none' }}
-                >
-                  {sectionEmptyLessons.map((l) => (
-                    <option key={l.id} value={l.id}>{label(l)}</option>
-                  ))}
-                </select>
+                {isActive ? (
+                  <select
+                    value={lesson.id}
+                    onChange={(e) => setLessonId(e.target.value)}
+                    className="input"
+                    style={{ appearance: 'none' }}
+                  >
+                    {sectionEmptyLessons.map((l) => (
+                      <option key={l.id} value={l.id}>{label(l)}</option>
+                    ))}
+                  </select>
+                ) : (
+                  // While saving/generating, show the lesson actually being
+                  // filled. A <select> here would fall back to its first option
+                  // once this lesson stops being "empty", and show the WRONG lesson.
+                  <div className="input" style={{ color: 'var(--color-n400)' }}>{label(lesson)}</div>
+                )}
                 {KIND_HINT[lesson.kind] && (
                   <p className="text-[12px] text-n600 mt-1.5 leading-relaxed">{KIND_HINT[lesson.kind]}</p>
                 )}
@@ -274,9 +308,18 @@ function Ingest() {
               </button>
 
               {step === 'generating' && (
-                <p className="text-[12px] text-n600 text-center leading-relaxed">
-                  Source is saved. You can close this tab — generation finishes in the background.
-                </p>
+                <div className="space-y-3">
+                  <p className="text-[12px] text-n600 text-center leading-relaxed">
+                    Source is saved to <span className="text-n400">{label(lesson)}</span>. You can close this tab — generation finishes in the background.
+                  </p>
+                  <div className="flex justify-center">
+                    <StopGeneration
+                      lessonId={lesson.id}
+                      onStopped={handleStopped}
+                      discardLabel="Stop and undo this paste"
+                    />
+                  </div>
+                </div>
               )}
             </div>
           )}

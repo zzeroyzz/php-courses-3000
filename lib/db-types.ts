@@ -63,7 +63,12 @@ export type LessonSummary = {
   sort_order: number;
   has_source: boolean;
   generated_at: string | null;     // null = generation not complete
-  generation_chunk: number | null; // non-null = generation failed at this chunk
+  generation_chunk: number | null; // chunk to resume from (failed or stopped there)
+  // Generation control (migration 013) — see contentStatus()
+  generation_run_id: string | null;
+  generation_heartbeat_at: string | null;
+  generation_cancel_requested_at: string | null;
+  generation_cancelled_at: string | null;
   created_at: string;
 };
 
@@ -78,21 +83,55 @@ export type Lesson = LessonSummary & {
 };
 
 export const LESSON_SUMMARY_COLUMNS =
-  'id, section_id, created_by, lesson_number, title, kind, sort_order, has_source, generated_at, generation_chunk, created_at';
+  'id, section_id, created_by, lesson_number, title, kind, sort_order, has_source, generated_at, generation_chunk, ' +
+  'generation_run_id, generation_heartbeat_at, generation_cancel_requested_at, generation_cancelled_at, created_at';
 
 // Global content state — the same for every user. Per-user completion is
 // separate (lesson_progress).
-export type ContentStatus = 'empty' | 'generating' | 'failed' | 'ready';
+//   empty       nothing pasted
+//   generating  a run is live (heartbeat within GENERATION_STALE_MS)
+//   cancelling  Stop was pressed; the live run will halt within seconds
+//   cancelled   the run was stopped (output so far is kept; resumable)
+//   failed      a chunk errored (resumable from generation_chunk)
+//   stalled     source but no live run: the run went silent (e.g. the server
+//               function hit its time limit) or generation never started
+//   ready       generated (or a document example, where drills are opt-in)
+//
+// Before migration 013, 'generating' covered both live and dead runs, which is
+// why clients carried 3-minute timeouts. The heartbeat makes a dead run
+// visible as 'stalled' from the row alone.
+export type ContentStatus =
+  | 'empty' | 'generating' | 'cancelling' | 'cancelled' | 'failed' | 'stalled' | 'ready';
 
-export function contentStatus(
-  lesson: Pick<LessonSummary, 'has_source' | 'generated_at' | 'generation_chunk' | 'kind'>
-): ContentStatus {
+// Must match GENERATION_STALE in migration 013. A run ticks every few seconds
+// while waiting on the model, so two minutes of silence means it's gone.
+export const GENERATION_STALE_MS = 2 * 60 * 1000;
+
+type StatusFields = Pick<
+  LessonSummary,
+  | 'has_source' | 'generated_at' | 'generation_chunk' | 'kind' | 'generation_run_id'
+  | 'generation_heartbeat_at' | 'generation_cancel_requested_at' | 'generation_cancelled_at'
+>;
+
+export function contentStatus(lesson: StatusFields, now = Date.now()): ContentStatus {
   if (!lesson.has_source) return 'empty';
   if (lesson.generated_at) return 'ready';
-  // Document examples are reading material; drill generation is opt-in.
-  if (lesson.kind === 'document') return 'ready';
+
+  const live = !!lesson.generation_run_id && !!lesson.generation_heartbeat_at
+    && now - new Date(lesson.generation_heartbeat_at).getTime() < GENERATION_STALE_MS;
+
+  if (lesson.generation_cancelled_at) return 'cancelled';
+  if (lesson.generation_cancel_requested_at) return live ? 'cancelling' : 'cancelled';
+  if (live) return 'generating';
   if (lesson.generation_chunk != null) return 'failed';
-  return 'generating';
+  // Document examples are reading material; drill generation is opt-in.
+  if (lesson.kind === 'document' && !lesson.generation_run_id) return 'ready';
+  return 'stalled';
+}
+
+// Statuses where generation has stopped short and an admin can resume it.
+export function isResumable(status: ContentStatus): boolean {
+  return status === 'cancelled' || status === 'failed';
 }
 
 // Image-only lessons count only once someone has typed up their content.

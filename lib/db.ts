@@ -6,7 +6,6 @@ import {
   type Section,
   type Lesson,
   type LessonSummary,
-  type Flashcard,
   type StudyCard,
   type Question,
   type Attempt,
@@ -148,37 +147,27 @@ export async function getLessonById(
   return data as Lesson;
 }
 
-// Admin: paste content into a seeded lesson. Resets generation state so the
-// lesson reads as 'generating' until /api/generate finishes.
+// Admin: paste content into a seeded empty lesson. Generation is started
+// separately (lib/generation-client.ts), which stamps a run id first.
+// Only fills an empty lesson: undoing a paste goes through clearLesson().
 export async function saveLessonSource(
   supabase: SupabaseClient,
   lessonId: string,
   sourceContent: string,
   createdBy: string
 ): Promise<boolean> {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('lessons')
-    .update({
-      source_content: sourceContent,
-      created_by: createdBy,
-      generated_at: null,
-      generation_chunk: null,
-    })
-    .eq('id', lessonId);
+    .update({ source_content: sourceContent, created_by: createdBy })
+    .eq('id', lessonId)
+    .eq('source_content', '')
+    .select('id');
+  if (!error && (data?.length ?? 0) === 0) {
+    console.error('[db] saveLessonSource: lesson already has content');
+    return false;
+  }
   if (error) { console.error('[db] saveLessonSource', error.message); return false; }
   return true;
-}
-
-export async function updateLessonGenerated(
-  supabase: SupabaseClient,
-  lessonId: string,
-  updates: { why_it_matters?: string; generated_at: string }
-): Promise<void> {
-  const { error } = await supabase
-    .from('lessons')
-    .update({ ...updates, generation_chunk: null })
-    .eq('id', lessonId);
-  if (error) console.error('[db] updateLessonGenerated', error.message);
 }
 
 export async function updateLessonDepth(
@@ -191,6 +180,39 @@ export async function updateLessonDepth(
     .update({ depth_content: depthContent, depth_generated_at: new Date().toISOString() })
     .eq('id', lessonId);
   if (error) { console.error('[db] updateLessonDepth', error.message); return false; }
+  return true;
+}
+
+// ── Generation control (migration 013) ────────────────────────────────────────
+
+// New run id for this lesson; reset=true also deletes earlier cards/questions
+// (a full restart). Returns null on failure.
+export async function queueGeneration(
+  supabase: SupabaseClient,
+  lessonId: string,
+  reset: boolean
+): Promise<string | null> {
+  const { data, error } = await supabase.rpc('queue_generation', { p_lesson_id: lessonId, p_reset: reset });
+  if (error) { console.error('[db] queueGeneration', error.message); return null; }
+  return data as string;
+}
+
+export type CancelResult = 'cancelling' | 'cancelled' | 'idle';
+
+export async function requestGenerationCancel(
+  supabase: SupabaseClient,
+  lessonId: string
+): Promise<CancelResult | null> {
+  const { data, error } = await supabase.rpc('request_generation_cancel', { p_lesson_id: lessonId });
+  if (error) { console.error('[db] requestGenerationCancel', error.message); return null; }
+  return data as CancelResult;
+}
+
+// Undo a paste: the lesson returns to empty and can be pasted again. Deletes
+// its cards and questions (and with them every student's progress on them).
+export async function clearLesson(supabase: SupabaseClient, lessonId: string): Promise<boolean> {
+  const { error } = await supabase.rpc('clear_lesson', { p_lesson_id: lessonId });
+  if (error) { console.error('[db] clearLesson', error.message); return false; }
   return true;
 }
 
@@ -278,26 +300,6 @@ export async function saveCardReview(
   if (error) console.error('[db] saveCardReview', error.message);
 }
 
-export async function insertFlashcards(
-  supabase: SupabaseClient,
-  cards: Omit<Flashcard, 'id' | 'created_at'>[]
-): Promise<void> {
-  if (cards.length === 0) return;
-  const { error } = await supabase.from('flashcards').insert(cards);
-  if (error) console.error('[db] insertFlashcards', error.message);
-}
-
-export async function deleteFlashcardsForLesson(
-  supabase: SupabaseClient,
-  lessonId: string
-): Promise<void> {
-  const { error } = await supabase
-    .from('flashcards')
-    .delete()
-    .eq('lesson_id', lessonId);
-  if (error) console.error('[db] deleteFlashcardsForLesson', error.message);
-}
-
 // ── Questions ─────────────────────────────────────────────────────────────────
 
 export async function getQuestions(
@@ -311,26 +313,6 @@ export async function getQuestions(
     .order('created_at', { ascending: true });
   if (error) { console.error('[db] getQuestions', error.message); return []; }
   return data as Question[];
-}
-
-export async function insertQuestions(
-  supabase: SupabaseClient,
-  questions: Omit<Question, 'id' | 'created_at'>[]
-): Promise<void> {
-  if (questions.length === 0) return;
-  const { error } = await supabase.from('questions').insert(questions);
-  if (error) console.error('[db] insertQuestions', error.message);
-}
-
-export async function deleteQuestionsForLesson(
-  supabase: SupabaseClient,
-  lessonId: string
-): Promise<void> {
-  const { error } = await supabase
-    .from('questions')
-    .delete()
-    .eq('lesson_id', lessonId);
-  if (error) console.error('[db] deleteQuestionsForLesson', error.message);
 }
 
 // ── Attempts ──────────────────────────────────────────────────────────────────

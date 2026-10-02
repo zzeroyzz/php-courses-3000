@@ -6,10 +6,13 @@ import Link from 'next/link';
 import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { AppNav } from '@/components/AppNav';
+import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
+import { startGeneration } from '@/lib/generation-client';
+import { useNow } from '@/lib/use-now';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
 import { scheduleCard, filterDue } from '@/lib/srs';
-import { contentStatus, displayLessonNumber, sectionLabel } from '@/lib/db-types';
+import { contentStatus, displayLessonNumber, isResumable, sectionLabel } from '@/lib/db-types';
 import type { ContentStatus, Lesson, Section, StudyCard, Question, QuestionType } from '@/lib/db-types';
 
 // Reading is one scrolling page (course text, then the generated depth layer);
@@ -146,7 +149,6 @@ export default function LessonPage() {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [completedAt, setCompletedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [generationError, setGenerationError] = useState(false);
 
   // Cards state
   const [reviewQueue, setReviewQueue] = useState<StudyCard[]>([]);
@@ -165,9 +167,6 @@ export default function LessonPage() {
   const [depthState, setDepthState] = useState<'idle' | 'working' | 'error'>('idle');
   const [depthError, setDepthError] = useState<string | null>(null);
 
-  // Admin asked for drills on a document example (otherwise documents have none).
-  const [drillsRequested, setDrillsRequested] = useState(false);
-
   // Anchor jump: switching to Read and locating the quote happen in separate
   // renders, because the source text only exists in the DOM once Read is shown.
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(searchParams.get('anchor'));
@@ -175,7 +174,6 @@ export default function LessonPage() {
 
   const sourceRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function reloadContent() {
     const [freshLesson, freshCards, freshQuestions] = await Promise.all([
@@ -190,25 +188,28 @@ export default function LessonPage() {
     return freshLesson;
   }
 
-  function watchGeneration(lessonId: string) {
-    function cleanup() {
-      if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
-      if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-    }
-    cleanup();
-    setGenerationError(false);
+  // Follow this lesson's row for as long as the page is open: generation
+  // progress, a Stop, or a Clear all arrive as updates to it. Status is
+  // derived from the row (contentStatus), so no client-side timeout is needed
+  // to notice a run that died.
+  function watchLesson(lessonId: string) {
+    if (channelRef.current) supabase.removeChannel(channelRef.current);
     channelRef.current = supabase
-      .channel(`lesson-gen-${lessonId}`)
+      .channel(`lesson-${lessonId}`)
       .on('postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'lessons', filter: `id=eq.${lessonId}` },
-        async (payload) => {
+        (payload) => {
           const row = payload.new as Lesson;
-          if (row.generated_at) { await reloadContent(); cleanup(); }
-          else if (row.generation_chunk != null) { setLesson((prev) => prev ? { ...prev, generation_chunk: row.generation_chunk } : prev); cleanup(); }
+          setLesson((prev) => {
+            // Finished, or cleared: cards and questions changed, reload them.
+            if (prev && ((row.generated_at && !prev.generated_at) || (!row.has_source && prev.has_source))) {
+              reloadContent();
+            }
+            return prev ? { ...prev, ...row } : row;
+          });
         }
       )
       .subscribe();
-    timeoutRef.current = setTimeout(() => { cleanup(); setGenerationError(true); }, 3 * 60 * 1000);
   }
 
   useEffect(() => {
@@ -236,12 +237,11 @@ export default function LessonPage() {
       setReviewQueue(filterDue(cardsData));
       setLoading(false);
 
-      if (contentStatus(lessonData) === 'generating') watchGeneration(lessonData.id);
+      watchLesson(lessonData.id);
     })();
 
     return () => {
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
-      if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [supabase, router, id]);
@@ -322,18 +322,17 @@ export default function LessonPage() {
     }
   }
 
-  // Admin: generate drills for a document example (opt-in for that kind).
-  async function handleGenerateDrills() {
+  // Admin: start drills for a document example (opt-in for that kind), or
+  // resume a run that was stopped or failed partway.
+  async function handleGenerate(reset: boolean) {
     if (!lesson) return;
-    setDrillsRequested(true);
-    setLesson((prev) => prev ? { ...prev, generated_at: null, generation_chunk: null } : prev);
-    watchGeneration(lesson.id);
-    fetch('/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lessonId: lesson.id }),
-    }).catch(() => {});
+    await startGeneration(supabase, lesson.id, { reset, chunkFrom: lesson.generation_chunk ?? 0 });
+    const fresh = await db.getLessonById(supabase, lesson.id);
+    if (fresh) setLesson(fresh);
   }
+
+  const liveStatus = lesson ? contentStatus(lesson) : 'empty';
+  const now = useNow(liveStatus === 'generating' || liveStatus === 'cancelling');
 
   if (loading || !lesson) {
     return (
@@ -348,11 +347,7 @@ export default function LessonPage() {
     );
   }
 
-  // Document examples read as 'ready' with no drills; once an admin requests
-  // drills, track that generation like any other lesson's.
-  const status: ContentStatus = drillsRequested && !lesson.generated_at
-    ? (lesson.generation_chunk != null ? 'failed' : 'generating')
-    : contentStatus(lesson);
+  const status: ContentStatus = contentStatus(lesson, now);
   const dueCount = filterDue(cards).length;
   const number = displayLessonNumber(lesson);
   const filteredQuestions = typeFilter === 'all' ? questions : questions.filter((q) => q.question_type === typeFilter);
@@ -365,10 +360,13 @@ export default function LessonPage() {
     <DrillState
       status={status}
       kind={lesson.kind}
-      generationError={generationError}
       isAdmin={isAdmin}
       lessonId={lesson.id}
-      onGenerateDrills={lesson.kind === 'document' && isAdmin && lesson.has_source && !lesson.generated_at && !drillsRequested ? handleGenerateDrills : undefined}
+      generationChunk={lesson.generation_chunk}
+      sectionSlug={section?.slug ?? null}
+      onGenerate={isAdmin ? handleGenerate : undefined}
+      onStopped={() => {}}
+      hasDrills={cards.length > 0 || questions.length > 0}
     />
   );
 
@@ -454,12 +452,19 @@ export default function LessonPage() {
                   </div>
                 )}
 
-                {(status === 'generating' || status === 'failed') && (
-                  <p className="text-[13px] text-n600">
-                    {status === 'failed' || generationError
-                      ? 'Cards and practice questions for this lesson aren’t ready yet.'
-                      : 'Cards and practice questions are being generated…'}
-                  </p>
+                {status !== 'ready' && (
+                  <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                    <p className="text-[13px] text-n600">
+                      {status === 'generating'
+                        ? 'Cards and practice questions are being generated…'
+                        : status === 'cancelling'
+                        ? 'Stopping generation…'
+                        : 'Cards and practice questions for this lesson aren’t ready yet.'}
+                    </p>
+                    {isAdmin && status === 'generating' && (
+                      <StopGeneration lessonId={lesson.id} onStopped={() => {}} />
+                    )}
+                  </div>
                 )}
 
                 {lesson.why_it_matters && (
@@ -502,6 +507,16 @@ export default function LessonPage() {
                   <p className="text-[12px] text-n600 text-center">
                     Completed {new Date(completedAt).toLocaleDateString()}
                   </p>
+                )}
+
+                {isAdmin && (
+                  <div className="pt-4 space-y-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
+                    <p className="text-[11px] font-medium text-n600 uppercase tracking-wide">Admin</p>
+                    <p className="text-[12px] text-n600 leading-relaxed">
+                      Pasted into the wrong lesson? Clearing returns it to &ldquo;not added&rdquo; so it can be pasted again.
+                    </p>
+                    <ClearLesson lessonId={lesson.id} onCleared={reloadContent} />
+                  </div>
                 )}
               </div>
             )
@@ -841,14 +856,17 @@ function DepthLayer({
 }
 
 function DrillState({
-  status, kind, generationError, isAdmin, lessonId, onGenerateDrills,
+  status, kind, isAdmin, lessonId, generationChunk, sectionSlug, onGenerate, onStopped, hasDrills,
 }: {
   status: ContentStatus;
   kind: Lesson['kind'];
-  generationError: boolean;
   isAdmin: boolean;
   lessonId: string;
-  onGenerateDrills?: () => void;
+  generationChunk: number | null;
+  sectionSlug: string | null;
+  onGenerate?: (reset: boolean) => void;
+  onStopped: () => void;
+  hasDrills: boolean;
 }) {
   const box = (title: string, body: string, action?: React.ReactNode) => (
     <div className="rounded-lg p-6 text-center space-y-2" style={{ background: 'var(--color-surface)' }}>
@@ -860,32 +878,53 @@ function DrillState({
 
   if (status === 'empty') {
     return box(
-      'This lesson hasn’t been added yet',
-      isAdmin ? 'Paste the lesson text to generate cards and questions.' : 'Cards and practice appear once it’s added.',
+      'This lesson hasn\u2019t been added yet',
+      isAdmin ? 'Paste the lesson text to generate cards and questions.' : 'Cards and practice appear once it\u2019s added.',
       isAdmin ? <Link href={`/ingest?lesson=${lessonId}`} className="btn btn-primary mt-2">Paste content</Link> : undefined
     );
   }
-  if (onGenerateDrills) {
-    return box(
-      'Reading material',
-      'Cards and questions aren’t generated for document examples by default.',
-      <button onClick={onGenerateDrills} className="btn btn-secondary mt-2">Generate cards &amp; questions</button>
-    );
-  }
-  if (kind === 'document' && status === 'ready') {
-    return box('Reading material', 'This document example has no cards or questions. Study it on the Read tab.');
-  }
-  if (status === 'failed' || generationError) {
-    return box(
-      'Not ready yet',
-      isAdmin ? 'Generation stopped partway. Resume it from the chapter page.' : 'Cards and questions for this lesson are still being prepared.'
-    );
-  }
-  if (status === 'generating') {
+  if (status === 'generating' || status === 'cancelling') {
     return (
       <div className="rounded-lg p-6 text-center space-y-3" style={{ background: 'var(--color-surface)' }}>
         <Spinner />
-        <p className="text-[14px] text-n500">Generating cards and questions…</p>
+        <p className="text-[14px] text-n500">
+          {status === 'cancelling' ? 'Stopping\u2026' : 'Generating cards and questions\u2026'}
+        </p>
+        {isAdmin && status === 'generating' && (
+          <div className="flex justify-center"><StopGeneration lessonId={lessonId} onStopped={onStopped} /></div>
+        )}
+      </div>
+    );
+  }
+  if (kind === 'document' && status === 'ready' && !hasDrills) {
+    return box(
+      'Reading material',
+      isAdmin
+        ? 'Cards and questions aren\u2019t generated for document examples by default.'
+        : 'This document example has no cards or questions. Study it on the Read tab.',
+      isAdmin && onGenerate
+        ? <button onClick={() => onGenerate(true)} className="btn btn-secondary mt-2">Generate cards &amp; questions</button>
+        : undefined
+    );
+  }
+  if (isResumable(status) || status === 'stalled') {
+    if (!isAdmin) return box('Not ready yet', 'Cards and questions for this lesson are still being prepared.');
+    const where = generationChunk != null ? ` at part ${generationChunk + 1}` : '';
+    const title =
+      status === 'cancelled' ? `Generation was stopped${where}`
+      : status === 'failed' ? `Generation failed${where}`
+      : 'Generation isn\u2019t running';
+    return box(
+      title,
+      status === 'stalled' ? 'It may have timed out. Start it again, or clear the lesson from the Read tab.' : 'What was generated so far is kept.',
+      <div className="flex justify-center gap-4 pt-2 text-[13px]">
+        {onGenerate && generationChunk != null && (
+          <button onClick={() => onGenerate(false)} style={{ color: 'var(--color-accent-md)' }}>Resume</button>
+        )}
+        {onGenerate && generationChunk == null && (
+          <button onClick={() => onGenerate(true)} style={{ color: 'var(--color-accent-md)' }}>Generate</button>
+        )}
+        {sectionSlug && <Link href={`/sections/${sectionSlug}`} className="text-n500 hover:text-fg">Start over from the chapter page</Link>}
       </div>
     );
   }

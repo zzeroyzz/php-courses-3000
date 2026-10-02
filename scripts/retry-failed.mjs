@@ -307,6 +307,11 @@ SELECT json_agg(row_to_json(t)) FROM (
   JOIN sections s ON s.id = l.section_id
   WHERE l.generated_at IS NULL AND l.source_content != ''
     AND l.kind <> 'document'  -- drill generation is opt-in for document examples
+    -- Never restart a lesson an admin deliberately stopped, or one with a live
+    -- run (heartbeat within the 2-minute GENERATION_STALE window, migration 013).
+    AND l.generation_cancelled_at IS NULL
+    AND l.generation_cancel_requested_at IS NULL
+    AND (l.generation_run_id IS NULL OR l.generation_heartbeat_at < now() - interval '2 minutes')
   ${singleId ? `AND l.id = '${singleId}'` : ''}
   ORDER BY length(l.source_content) ASC
 ) t
