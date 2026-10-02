@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@/utils/supabase/server';
 import * as db from '@/lib/db';
+import { COURSE_CONTEXT } from '@/lib/course';
+import { GENERATION_MODEL, requireAdmin } from '@/lib/generation';
 import type { QuestionMix } from '@/lib/db-types';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -34,25 +36,44 @@ function splitOnParagraphs(text: string, limit: number): string[] {
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
+//
+// Everything this route generates goes on the spaced-repetition schedule
+// (flashcards) or into scored practice (questions), so it must come from the
+// pasted source and nothing else, each item carrying a verbatim source_anchor.
+//
+// This is not caution for its own sake. Spaced repetition cements whatever it
+// schedules: a wrong flashcard reviewed eight times over six weeks becomes a
+// wrong answer the student trusts more than a right one they saw once. So the
+// drilled set must be the verifiable set. Elaboration beyond the source belongs
+// in the separate, visibly-marked depth layer (/api/generate-depth), which is a
+// text column and can never enter the review queue. Do not loosen this prompt
+// to "add helpful context".
+
+const SOURCING_RULES = `Sourcing rules — these override everything else:
+- Use ONLY facts stated in the source text. Do not add facts, numbers, deadlines, rule citations or exceptions from general knowledge, even if you believe them to be true.
+- Every question's correct answer and every flashcard's back must be directly supported by the source.
+- source_anchor: a short verbatim quote (≤30 words) copied exactly from the source that supports the answer.
+- If the source can only support fewer items than requested, return fewer.`;
 
 function firstChunkPrompt(mix: QuestionMix, n: number): string {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building study material for the NMLS Mortgage Loan Originator (MLO) licensing exam.
+  return `You are building study material for ${COURSE_CONTEXT}.
 
 Given a lesson title and source text, produce:
-1. A short "why it matters" paragraph (2–4 sentences) explaining why this topic appears on the NMLS exam and what a working MLO needs to know.
-2. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. A short "why it matters" paragraph (2–4 sentences) explaining, from the source, why this topic matters on the licensing exam and in a licensee's work.
+2. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 3. 8–20 flashcards (description→term: front describes a concept/situation, back gives the precise term/rule/number).
 
+${SOURCING_RULES}
+
 Question requirements:
-- Use named fictional borrowers (Maria, James, etc.) in scenario questions.
+- Use named fictional buyers, sellers, tenants and licensees in scenario questions.
 - All four options must be plausible; wrong answers should be true facts about related topics (true-but-incomplete distractors).
 - Avoid starting every stem with "Which of the following".
 - Explanation must say why the correct answer is right AND why the best wrong answer fails.
 - For calculation questions, show full worked arithmetic in the explanation.
-- source_anchor: a short verbatim quote (≤30 words) from the source that supports the correct answer.
 
 Return strict JSON only — no markdown fences, no preamble:
 {
@@ -77,13 +98,15 @@ function continuationChunkPrompt(mix: QuestionMix, n: number): string {
   const f = Math.round(n * mix.factual);
   const s = Math.round(n * mix.scenario);
   const c = n - f - s;
-  return `You are building additional study material for the NMLS MLO licensing exam from a continuation of a longer source document.
+  return `You are building additional study material for ${COURSE_CONTEXT}, from a continuation of a longer source document.
 
 Produce:
-1. Exactly ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
+1. Up to ${n} multiple-choice questions: ${f} factual, ${s} scenario, ${c} calculation.
 2. 6–14 flashcards (description→term direction).
 
-Apply the same quality requirements: named fictional borrowers, plausible distractors, worked arithmetic, source_anchor ≤30 words verbatim from the source.
+${SOURCING_RULES}
+
+Apply the same quality requirements: named fictional buyers, sellers and licensees in scenarios, plausible distractors, worked arithmetic.
 
 Return strict JSON only — no markdown fences:
 {
@@ -137,42 +160,90 @@ function parseJSON<T>(text: string): T {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
+//
+// Cancellation is cooperative (migration 013). The client stamps a run id on
+// the lesson (queue_generation) before calling this route, and this run only
+// writes while that id is still current and no Stop has been requested:
+//   - before each chunk, and every TICK_MS while waiting on the model,
+//     generation_tick() refreshes the heartbeat and says whether to continue;
+//     a "no" aborts the in-flight Anthropic request
+//   - each chunk is written by save_generated_chunk(), which re-checks the run
+//     under a row lock, so a Stop or Clear can never interleave with a write
+// Whatever this run saved before a Stop is kept ("stop and keep");
+// discarding is the separate clear_lesson().
+
+const TICK_MS = 5_000;
+
+type LessonClient = Awaited<ReturnType<typeof createClient>>;
+
+async function stillCurrent(supabase: LessonClient, lessonId: string, runId: string): Promise<boolean> {
+  const { data, error } = await supabase.rpc('generation_tick', { p_lesson_id: lessonId, p_run_id: runId });
+  if (error) { console.error('[generate] tick', error.message); return true; }   // don't abort on a blip
+  return data === true;
+}
+
+// Mark this run stopped, remembering where to resume. Conditional on the run
+// id: if a newer run or a Clear has taken over, this is a no-op.
+async function finishCancelled(supabase: LessonClient, lessonId: string, runId: string, nextChunk: number) {
+  await supabase.from('lessons')
+    .update({ generation_cancelled_at: new Date().toISOString(), generation_run_id: null, generation_chunk: nextChunk })
+    .eq('id', lessonId).eq('generation_run_id', runId);
+  console.log(`[generate] lesson=${lessonId} run=${runId} stopped before chunk ${nextChunk + 1}`);
+}
 
 export async function POST(request: NextRequest) {
-  const body = await request.json() as {
-    lessonId: string;
-    title: string;
-    sourceContent: string;
-    questionMix: QuestionMix;
-    chunkFrom?: number;   // resume point; default 0 (full restart)
+  const body = await request.json().catch(() => ({})) as {
+    lessonId?: string;
+    runId?: string;
+    chunkFrom?: number;   // resume point; 0 = from the start (queue_generation already cleared old output)
   };
 
-  const { lessonId, title, sourceContent, questionMix } = body;
+  const { lessonId, runId } = body;
   const chunkFrom = body.chunkFrom ?? 0;
 
-  if (!sourceContent?.trim()) {
-    return NextResponse.json({ error: 'No source content provided' }, { status: 400 });
-  }
-  if (!lessonId) {
-    return NextResponse.json({ error: 'lessonId required' }, { status: 400 });
+  if (!lessonId || !runId) {
+    return NextResponse.json({ error: 'lessonId and runId required' }, { status: 400 });
   }
 
   const supabase = await createClient();
+
+  const auth = await requireAdmin(supabase);
+  if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
+
+  // Read title, source and question mix from the database rather than trusting
+  // the request body.
+  const lesson = await db.getLessonById(supabase, lessonId);
+  if (!lesson) return NextResponse.json({ error: 'Lesson not found' }, { status: 404 });
+  const section = await db.getSectionById(supabase, lesson.section_id);
+  if (!section) return NextResponse.json({ error: 'Section not found' }, { status: 404 });
+
+  // A request for a run that's already been stopped, cleared or superseded
+  // (e.g. Stop pressed before this request even arrived) does nothing.
+  if (!(await stillCurrent(supabase, lessonId, runId))) {
+    await finishCancelled(supabase, lessonId, runId, chunkFrom);
+    return NextResponse.json({ cancelled: true, stoppedBeforeChunk: chunkFrom });
+  }
+
+  const sourceContent = lesson.source_content;
+  const title = lesson.title;
+  const questionMix = section.question_mix;
+
+  if (!sourceContent?.trim()) {
+    return NextResponse.json({ error: 'Lesson has no source content' }, { status: 400 });
+  }
+
   const chunks = splitOnParagraphs(sourceContent.trim(), CHUNK_LIMIT);
   const totalWords = sourceContent.trim().split(/\s+/).length;
   const isMultiChunk = chunks.length > 1;
 
-  console.log(`[generate] lesson=${lessonId} chunks=${chunks.length} totalChars=${sourceContent.length} resumeFrom=${chunkFrom}`);
-
-  // On a full restart (chunkFrom === 0), wipe any previous content
-  if (chunkFrom === 0) {
-    await db.deleteFlashcardsForLesson(supabase, lessonId);
-    await db.deleteQuestionsForLesson(supabase, lessonId);
-  }
-
-  let whyItMatters: string | null = null;
+  console.log(`[generate] lesson=${lessonId} run=${runId} chunks=${chunks.length} totalChars=${sourceContent.length} resumeFrom=${chunkFrom}`);
 
   for (let i = chunkFrom; i < chunks.length; i++) {
+    if (i > chunkFrom && !(await stillCurrent(supabase, lessonId, runId))) {
+      await finishCancelled(supabase, lessonId, runId, i);
+      return NextResponse.json({ cancelled: true, stoppedBeforeChunk: i });
+    }
+
     const chunk = chunks[i];
     const chunkWords = chunk.split(/\s+/).length;
     const chunkQuestions = Math.max(6, Math.round(Math.max(12, Math.min(30, Math.round(totalWords / 130))) * (chunkWords / totalWords)));
@@ -190,14 +261,25 @@ export async function POST(request: NextRequest) {
 
     let questions: QuestionRow[];
     let flashcards: FlashcardRow[];
+    let whyItMatters: string | null = null;
+
+    // While the model works, keep the heartbeat fresh and abort the request
+    // the moment a Stop or Clear lands, instead of waiting out the completion.
+    const controller = new AbortController();
+    const ticker = setInterval(async () => {
+      if (!(await stillCurrent(supabase, lessonId, runId))) controller.abort();
+    }, TICK_MS);
 
     try {
-      const message = await client.messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 8192,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMessage }],
-      });
+      const message = await client.messages.create(
+        {
+          model: GENERATION_MODEL,
+          max_tokens: 8192,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userMessage }],
+        },
+        { signal: controller.signal }
+      );
 
       console.log(`[generate] chunk ${i + 1}/${chunks.length} tokens: input=${message.usage.input_tokens} output=${message.usage.output_tokens}`);
 
@@ -212,9 +294,6 @@ export async function POST(request: NextRequest) {
         whyItMatters = parsed.whyItMatters;
         questions = parsed.questions;
         flashcards = parsed.flashcards;
-
-        // Persist whyItMatters immediately (so we have it even if later chunks fail)
-        await supabase.from('lessons').update({ why_it_matters: whyItMatters }).eq('id', lessonId);
       } else {
         const parsed = parseJSON<ContinuationResponse>(block.text);
         if (!Array.isArray(parsed.questions) || !Array.isArray(parsed.flashcards)) {
@@ -224,44 +303,56 @@ export async function POST(request: NextRequest) {
         flashcards = parsed.flashcards;
       }
     } catch (err) {
-      // Record which chunk failed so the next retry can resume
-      await supabase.from('lessons').update({ generation_chunk: i }).eq('id', lessonId);
+      if (controller.signal.aborted) {
+        await finishCancelled(supabase, lessonId, runId, i);
+        return NextResponse.json({ cancelled: true, stoppedBeforeChunk: i });
+      }
+      // Record which chunk failed so the next retry can resume — only if this
+      // run is still the lesson's run.
+      await supabase.from('lessons').update({ generation_chunk: i, generation_run_id: null })
+        .eq('id', lessonId).eq('generation_run_id', runId);
       console.error(`[generate] chunk ${i + 1}/${chunks.length} FAILED`, err);
       const msg = err instanceof Error ? err.message : 'Generation failed';
       return NextResponse.json({ error: msg, failedChunk: i }, { status: 500 });
+    } finally {
+      clearInterval(ticker);
     }
 
-    // Insert this chunk's output
-    await db.insertFlashcards(
-      supabase,
-      flashcards.map((c) => ({
-        lesson_id: lessonId,
-        front: c.front,
-        back: c.back,
-        source_anchor: c.source_anchor ?? null,
-      }))
-    );
-
-    await db.insertQuestions(
-      supabase,
-      questions.map((q) => ({
-        lesson_id: lessonId,
+    // Write this chunk only if the run is still current (checked under a row
+    // lock inside the function). A Stop that arrived after the model finished
+    // discards this chunk; earlier chunks stay.
+    const { data: saved, error: saveError } = await supabase.rpc('save_generated_chunk', {
+      p_lesson_id: lessonId,
+      p_run_id: runId,
+      p_cards: flashcards.map((c) => ({ front: c.front, back: c.back, source_anchor: c.source_anchor ?? null })),
+      p_questions: questions.map((q) => ({
         question_type: q.question_type,
         stem: q.stem,
         options: q.options,
         correct_index: q.correct_index,
         explanation: q.explanation,
         source_anchor: q.source_anchor ?? null,
-      }))
-    );
+      })),
+      p_why_it_matters: whyItMatters,
+    });
+
+    if (saveError) {
+      await supabase.from('lessons').update({ generation_chunk: i, generation_run_id: null })
+        .eq('id', lessonId).eq('generation_run_id', runId);
+      console.error(`[generate] chunk ${i + 1}/${chunks.length} save FAILED`, saveError.message);
+      return NextResponse.json({ error: saveError.message, failedChunk: i }, { status: 500 });
+    }
+    if (saved !== true) {
+      await finishCancelled(supabase, lessonId, runId, i);
+      return NextResponse.json({ cancelled: true, stoppedBeforeChunk: i });
+    }
   }
 
-  // All chunks complete — mark lesson generated and clear chunk cursor
-  await db.updateLessonGenerated(supabase, lessonId, {
-    why_it_matters: whyItMatters ?? '',
-    generated_at: new Date().toISOString(),
-  });
-  await supabase.from('lessons').update({ generation_chunk: null }).eq('id', lessonId);
+  // All chunks complete. Conditional on the run id, so a run that was cleared
+  // or superseded at the last moment can't mark the lesson generated.
+  await supabase.from('lessons')
+    .update({ generated_at: new Date().toISOString(), generation_chunk: null, generation_run_id: null })
+    .eq('id', lessonId).eq('generation_run_id', runId);
 
   return NextResponse.json({ ok: true, chunks: chunks.length });
 }

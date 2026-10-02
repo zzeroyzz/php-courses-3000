@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
+import { APP_NAME, COURSE_NAME } from '@/lib/course';
 
 const inter = Inter({
   subsets: ['latin'],
@@ -9,8 +10,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: 'MLO Study',
-  description: 'NMLS Mortgage Loan Originator exam prep — learn, flashcards, practice quizzes.',
+  title: APP_NAME,
+  description: `${COURSE_NAME} — lessons, flashcards, practice questions.`,
   icons: { icon: '/favicon.ico' },
 };
 

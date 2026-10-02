@@ -1,142 +1,86 @@
-# MLO Study
+# GA Real Estate Study
 
-A mobile-first NMLS Mortgage Loan Originator exam prep app with AI-generated study materials, spaced-repetition flashcards, and a gamification layer.
+A mobile-first study app for the **Georgia Real Estate Licensing Course** (RealEstateU, v.2).
+An admin pastes each lesson's text; Claude generates flashcards and practice questions from it;
+every student studies with their own spaced-repetition schedule, completion and accuracy.
 
-## Features
+For how it works inside — data model, generation pipeline, status rules, known gaps — read
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-- **Add Lesson** — paste raw lesson text; Claude generates cleaned notes, flashcards, and quiz questions; review and edit before saving
-- **Learn** — browse modules/lessons with markdown rendering, mark lessons as read, prev/next navigation
-- **Flashcards** — tap-to-flip cards with a 5-box Leitner spaced-repetition system
-- **Practice** — multiple-choice quizzes with immediate feedback and explanations; per-module or all-modules filter
-- **Gamification** — XP, levels, daily streak, 14 achievement badges, per-module mastery %, daily goal ring
-- **Auth** — email + password sign-in via Supabase; all progress syncs across devices
+## What it does
 
-## Tech Stack
+- **Course structure seeded up front.** Orientation, Chapters 1–35 and Final Exam Instructions
+  (37 sections, 393 lessons) exist from day one; content is pasted lesson by lesson.
+- **Generation from pasted source only.** Flashcards and questions quote the lesson text
+  (`source_anchor`), so anything a student drills can be checked against the course. A separate,
+  clearly labelled "Going deeper" layer is generated on demand and never drilled. Generated depth is
+  switched off for the Georgia statute chapters (2, 3, 10, 17, 24).
+- **Cancellable generation.** Stop and keep what's done (resumable), or stop and clear the lesson.
+  Clearing a lesson is also the undo for a wrong paste.
+- **Per-user study.** SM-2 card scheduling, lesson completion and practice attempts are per user.
+  A card joins your review schedule when you complete its lesson.
+- **Course navigation.** A collapsible course tree (chapters → lessons), previous/next lesson, and a
+  course map on Home.
+- **Roles and invites.** Admins add content and invite students with single-use, per-person links;
+  students study. Forgot-password via email.
 
-- [Next.js 16](https://nextjs.org) (App Router + TypeScript)
-- [Tailwind CSS v4](https://tailwindcss.com)
-- [Supabase](https://supabase.com) — Auth + Postgres with Row Level Security
-- [Anthropic API](https://anthropic.com) — `claude-sonnet-4-6` for content generation (server-side only)
-- Deploy target: [Vercel](https://vercel.com)
+## Stack
 
----
+Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS v4 · Supabase (Auth, Postgres, RLS,
+Realtime) · Anthropic API (`claude-sonnet-4-6`, set in `lib/generation.ts`).
 
-## Local Development
-
-### 1. Prerequisites
-
-- Node.js 18+
-- A [Supabase](https://supabase.com) project (free tier is fine)
-- An [Anthropic API key](https://console.anthropic.com)
-
-### 2. Clone & install
+## Local development
 
 ```bash
-git clone <your-repo-url>
-cd php-courses-3000
 npm install
-```
-
-### 3. Set up the database
-
-In the Supabase dashboard → **SQL Editor**, run both migration files in order:
-
-```
-supabase/migrations/001_initial_schema.sql   # profiles, progress, achievements
-supabase/migrations/002_user_content.sql     # user_modules, user_lessons, user_flashcards, user_quiz_questions
-```
-
-### 4. Configure environment variables
-
-```bash
-cp .env.local.example .env.local
-```
-
-Edit `.env.local`:
-
-```
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-> `.env.local` is gitignored and never committed.
-
-### 5. Disable email confirmation for local dev
-
-By default Supabase requires users to confirm their email before they can sign in, which means every "Create account" attempt during development triggers a confirmation email — annoying when you're iterating quickly.
-
-**To skip email confirmation locally:**
-
-Supabase dashboard → **Authentication → Providers → Email** → toggle off **"Confirm email"**
-
-With this off, creating an account immediately signs you in with no email sent.  
-> Re-enable it for production if you want email verification.
-
-### 6. Run the dev server
-
-```bash
+cp .env.local.example .env.local   # fill in the values below
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+| Variable | Where it's used |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Browser and server |
+| `ANTHROPIC_API_KEY` | `/api/generate`, `/api/generate-depth` (server only) |
+| `SUPABASE_SERVICE_ROLE_KEY` | Invite routes only (server only — never `NEXT_PUBLIC_`) |
 
----
+## Database
 
-## Deploying to Vercel
+Migrations live in `supabase/migrations/`. On an existing project, apply them with `psql` one file
+at a time in a transaction (`--single-transaction -v ON_ERROR_STOP=1`); the history table isn't
+tracked, so check `supabase migration list` before ever using `supabase db push`.
 
-### 1. Import into Vercel
+| File | What it does |
+|---|---|
+| `001`–`005b` | v1 history, dead (kept so the sequence replays) |
+| `006` | v2 schema — **drops tables; never re-run on a database with content** |
+| `009` | Generation resume cursor |
+| `010` | Multi-user roles, per-user progress, wipes the old MLO content (**destructive**) |
+| `011` | Georgia course structure seed — generated by `scripts/build-course-seed.mjs` from `scripts/course-data/` |
+| `012` | Invites |
+| `013` | Cancellable generation and clearing a lesson |
 
-Go to [vercel.com/new](https://vercel.com/new) and import your GitHub repo. Framework preset: **Next.js** (auto-detected).
+**Becoming admin:** accounts existing when `010` ran became admin; later accounts are students.
+Promote one in the SQL editor:
+`update profiles set role = 'admin' where user_id = (select id from auth.users where email = '…');`
 
-### 2. Add Environment Variables
+## Supabase dashboard settings
 
-In Vercel → **Project Settings → Environment Variables**:
+- **Authentication → Sign In / Providers:** turn off "Allow new users to sign up" (keep the Email
+  provider on). Accounts are created only by redeeming an invite.
+- **Authentication → URL Configuration:** set the Site URL; add `<origin>/auth/callback` to the
+  redirect allowlist.
+- **Email template "Reset Password"** (recommended, works across devices):
+  `{{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash }}&type=recovery&next=/reset-password`
+- **Custom SMTP** before real students arrive — the built-in sender is rate-limited.
 
-| Key | Value |
-|-----|-------|
-| `NEXT_PUBLIC_SUPABASE_URL` | Your Supabase project URL |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Your Supabase anon public key |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key (server-side only) |
+## Scripts
 
-### 3. Configure Supabase for production
-
-In Supabase → **Authentication → URL Configuration**:
-
-- **Site URL**: `https://your-app.vercel.app`
-
-> The auth callback route is no longer used (email+password doesn't need it), but setting Site URL correctly ensures Supabase session cookies work across your domain.
-
-### 4. Deploy
-
-Click **Deploy**. Vercel rebuilds automatically on every push to main.
-
----
-
-## Project Structure
-
+```bash
+node scripts/build-course-seed.mjs scripts/course-data/georgia-re-v2-outline.txt   # regenerate 011
+node scripts/retry-failed.mjs [--small-only|--large-only]                           # resume failed generations (psql, bypasses RLS)
 ```
-app/
-  page.tsx                           # Home dashboard
-  sign-in/page.tsx                   # Email + password sign-in / sign-up
-  add-lesson/page.tsx                # AI content generation flow
-  api/generate/route.ts              # Server-side Anthropic API route
-  learn/page.tsx                     # Module list
-  learn/[moduleId]/page.tsx          # Redirect to first lesson
-  learn/[moduleId]/[lessonId]/       # Lesson viewer
-  flashcards/page.tsx                # Leitner flashcard session
-  practice/page.tsx                  # Multiple-choice quiz
 
-components/                          # Shared UI components
-hooks/                               # Data-fetching hooks (optimistic updates)
-lib/
-  db.ts                              # Typed data-access layer (all Supabase calls)
-  db-types.ts                        # TypeScript types for DB schema
-  gamification.ts                    # XP, levels, streaks, achievements
-  leitner.ts                         # Spaced-repetition scheduling
-utils/supabase/
-  client.ts                          # Browser Supabase client
-  server.ts                          # Server-side Supabase client (cookies)
-supabase/migrations/                 # SQL migration files
-middleware.ts                        # Auth protection + session refresh
-```
+## Deploying
+
+Vercel. Set the four environment variables above in the project settings and deploy. The deployed
+code and the database migrations must move together — this code reads columns added by `012`/`013`.

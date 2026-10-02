@@ -4,6 +4,7 @@
 :root {
   --color-bg:         #161826;
   --color-surface:    #232532;
+  --color-surface-sunk: #1b1d2c;
   --color-fg:         #e9e9ed;
   --color-accent:     #9184d9;
   --color-divider:    color-mix(in srgb, #e9e9ed 16%, transparent);
@@ -19,11 +20,13 @@
   --color-accent-hi:  #d2cefd;
   --color-accent-md:  #b5abfc;
   --color-accent-dk:  #423a6a;
+  --color-accent-tint: rgba(145, 132, 217, 0.12);   /* active rail item (handoff spec) */
 }
 
 @theme inline {
   --color-bg:         #161826;
   --color-surface:    #232532;
+  --color-surface-sunk: #1b1d2c;
   --color-fg:         #e9e9ed;
   --color-accent:     #9184d9;
   --color-divider:    color-mix(in srgb, #e9e9ed 16%, transparent);
@@ -39,6 +42,7 @@
   --color-accent-hi:  #d2cefd;
   --color-accent-md:  #b5abfc;
   --color-accent-dk:  #423a6a;
+  --color-accent-tint: rgba(145, 132, 217, 0.12);   /* active rail item (handoff spec) */
 
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
 }
@@ -169,6 +173,22 @@ body {
     var(--color-divider) calc(100% - 48px),
     transparent
   ) no-repeat bottom / 100% 1px;
+}
+
+/* Section table (md+): the same fading rule above each row. */
+@media (min-width: 768px) {
+  .table-row-rule {
+    background-image: linear-gradient(
+      to right,
+      transparent,
+      var(--color-divider) 48px,
+      var(--color-divider) calc(100% - 48px),
+      transparent
+    );
+    background-repeat: no-repeat;
+    background-position: top;
+    background-size: 100% 1px;
+  }
 }
 
 /* ── Utilities ── */

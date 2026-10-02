@@ -84,7 +84,7 @@ export const ACHIEVEMENTS: AchievementDef[] = [
   { id: 'module_master', title: 'Module Master',   description: 'Reach 80% mastery in a module', icon: '🎓' },
   { id: 'daily_goal',    title: 'Goal Crusher',    description: 'Hit your daily card goal',       icon: '💪' },
   { id: 'level_5',       title: 'Rising Star',     description: 'Reach level 5',                  icon: '⚡' },
-  { id: 'level_10',      title: 'MLO Expert',      description: 'Reach level 10',                 icon: '🎖️' },
+  { id: 'level_10',      title: 'Course Expert',   description: 'Reach level 10',                 icon: '🎖️' },
 ];
 
 export type AchievementCheckContext = {

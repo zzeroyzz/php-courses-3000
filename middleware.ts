@@ -30,8 +30,18 @@ export async function middleware(request: NextRequest) {
 
   const { pathname } = request.nextUrl;
 
-  // Allow public paths
-  if (pathname.startsWith('/sign-in') || pathname.startsWith('/auth/')) {
+  // Allow public paths. Invite redemption and password reset run before the
+  // visitor has a session; /api/invites (creating invites) stays gated.
+  const PUBLIC_PREFIXES = [
+    '/sign-in',
+    '/auth/',
+    '/invite/',
+    '/forgot-password',
+    '/reset-password',
+    '/api/invites/validate',
+    '/api/invites/accept',
+  ];
+  if (PUBLIC_PREFIXES.some((p) => pathname.startsWith(p))) {
     return supabaseResponse;
   }
 

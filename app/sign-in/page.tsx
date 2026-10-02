@@ -2,7 +2,9 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { createClient } from '@/utils/supabase/client';
+import { APP_NAME, COURSE_NAME } from '@/lib/course';
 
 export default function SignInPage() {
   const router = useRouter();
@@ -32,9 +34,9 @@ export default function SignInPage() {
       <div className="w-full max-w-sm mx-auto md:ml-[15vw]">
 
         <div className="mb-10">
-          <h1 className="text-[38px] font-medium text-fg leading-none tracking-[-0.03em]">MLO Study</h1>
+          <h1 className="text-[38px] font-medium text-fg leading-none tracking-[-0.03em]">{APP_NAME}</h1>
           <p className="text-[14px] text-n500 mt-3 leading-relaxed">
-            NMLS exam prep. Your progress syncs across all devices.
+            {COURSE_NAME}. Your progress syncs across all devices.
           </p>
         </div>
 
@@ -78,6 +80,10 @@ export default function SignInPage() {
           >
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
+
+          <Link href="/forgot-password" className="block text-[13px] text-n500 hover:text-fg transition-colors">
+            Forgot password?
+          </Link>
         </form>
       </div>
     </main>
