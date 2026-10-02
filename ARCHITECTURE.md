@@ -1,11 +1,11 @@
 # GA Real Estate Study — Architecture Reference
 
-A complete technical breakdown of this application as it actually exists on branch
-`feat/nocturne-redesign`.
+A technical breakdown of this application. §0 describes it as it exists on
+`feat/georgia-real-estate`; §1–§16 are the original reference for the single-user MLO version
+(branch `feat/nocturne-redesign`), kept for the reasoning behind the design.
 
-> **Read this first, not `README.md`.** The README describes v1 and is stale — see
-> [§16 Documentation map](#16-documentation-map). This document was written by reading the
-> source, and every formula and line reference in it was verified against the code.
+> `README.md` covers setup, environment variables, migrations and dashboard settings. This
+> document covers how the system works.
 
 ## 0. Current state (read this first)
 
