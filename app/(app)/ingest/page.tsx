@@ -213,7 +213,7 @@ function Ingest() {
               area is the page, with a 320px column for chapter, lesson and the
               button. */}
           {lesson && section && step !== 'done' && (
-            <div className="grid gap-4 md:gap-x-8 md:grid-cols-[minmax(0,1fr)_320px] md:[grid-template-areas:'err_err'_'text_side'_'text_actions']">
+            <div className="grid gap-4 md:gap-x-8 md:grid-cols-[minmax(0,1fr)_320px] md:grid-rows-[auto_auto_1fr] md:[grid-template-areas:'err_err'_'text_side'_'text_actions']">
               {errorMsg && step === 'error' && (
                 <div className="rounded-lg px-4 py-3 text-[13px] text-n400 md:[grid-area:err]"
                   style={{ background: 'var(--color-surface)', border: '1px solid var(--color-divider)' }}>
@@ -278,7 +278,7 @@ function Ingest() {
                   value={sourceContent}
                   onChange={(e) => setSourceContent(e.target.value)}
                   disabled={!isActive}
-                  className="input md:min-h-[520px] md:text-[15px]"
+                  className="input md:min-h-[520px]! md:text-[15px]!"
                   style={{ resize: 'none', lineHeight: '1.65' }}
                 />
                 <div className="flex items-center justify-between mt-1.5">
