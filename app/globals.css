@@ -20,6 +20,7 @@
   --color-accent-hi:  #d2cefd;
   --color-accent-md:  #b5abfc;
   --color-accent-dk:  #423a6a;
+  --color-accent-tint: rgba(145, 132, 217, 0.12);   /* active rail item (handoff spec) */
 }
 
 @theme inline {
@@ -41,6 +42,7 @@
   --color-accent-hi:  #d2cefd;
   --color-accent-md:  #b5abfc;
   --color-accent-dk:  #423a6a;
+  --color-accent-tint: rgba(145, 132, 217, 0.12);   /* active rail item (handoff spec) */
 
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
 }

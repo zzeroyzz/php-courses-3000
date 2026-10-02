@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/utils/supabase/client';
-import { AppNav } from '@/components/AppNav';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
 import { inviteStatus, INVITE_DEFAULT_DAYS } from '@/lib/invites';
@@ -103,9 +102,8 @@ export default function InvitesPage() {
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
-      <AppNav />
 
-      <div className="md:ml-56">
+      <div >
         <header className="px-5 py-4 md:px-8" style={{ borderBottom: '1px solid var(--color-divider)' }}>
           <h1 className="text-[17px] font-medium text-fg">Invites</h1>
           <p className="text-[13px] text-n500 mt-0.5">

@@ -4,7 +4,6 @@ import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CheckCircle } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
-import { AppNav } from '@/components/AppNav';
 import { StopGeneration } from '@/components/GenerationControls';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
@@ -170,9 +169,8 @@ function Ingest() {
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
-      <AppNav />
 
-      <div className="md:ml-56">
+      <div >
         <div className="max-w-2xl mx-auto w-full px-5 py-6 space-y-5">
           <header>
             <h1 className="text-[17px] font-medium text-fg">Add lesson content</h1>

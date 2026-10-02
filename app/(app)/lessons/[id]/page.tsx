@@ -5,12 +5,13 @@ import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
-import { AppNav } from '@/components/AppNav';
 import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
 import { DepthLayer, LessonSource, findInSource, revealRange } from '@/components/LessonReading';
 import type { SourceLayout } from '@/components/LessonReading';
 import { startGeneration } from '@/lib/generation-client';
 import { useNow } from '@/lib/use-now';
+import { useCourse } from '@/lib/course-context';
+import { LessonPager } from '@/components/LessonPager';
 import { getViewer } from '@/lib/viewer';
 import * as db from '@/lib/db';
 import { scheduleCard, filterDue } from '@/lib/srs';
@@ -34,6 +35,7 @@ export default function LessonPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
+  const course = useCourse();
 
   const rawTab = searchParams.get('tab');
   const initialTab: Tab =
@@ -210,6 +212,8 @@ export default function LessonPage() {
     if (!lesson || !userId) return;
     await db.markLessonComplete(supabase, userId, lesson.id);
     setCompletedAt(new Date().toISOString());
+    course?.markCompleted(lesson.id);
+    course?.refreshProgress();   // its cards just joined the review schedule
   }
 
   async function handleGenerateDepth() {
@@ -247,8 +251,7 @@ export default function LessonPage() {
   if (loading || !lesson) {
     return (
       <div className="min-h-dvh bg-bg pb-24">
-        <AppNav />
-        <div className="md:ml-56 max-w-2xl mx-auto px-5 py-20 space-y-4">
+        <div className="max-w-2xl mx-auto px-5 py-20 space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
             <div key={i} className="h-12 animate-pulse rounded-lg" style={{ background: 'var(--color-surface)' }} />
           ))}
@@ -282,9 +285,8 @@ export default function LessonPage() {
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
-      <AppNav />
 
-      <div className="md:ml-56">
+      <div >
         {/* ── Header ── */}
         <header className="px-5 py-4 md:px-8" style={{ borderBottom: '1px solid var(--color-divider)' }}>
           {section && (
@@ -333,7 +335,7 @@ export default function LessonPage() {
         </div>
 
         {/* ── Tab content ── */}
-        <div className="max-w-2xl mx-auto px-5 py-6 md:px-8">
+        <div className="max-w-2xl xl:max-w-[1080px] mx-auto px-5 py-6 md:px-8">
 
           {/* ── Read: course text, then the depth layer, as one page ── */}
           {tab === 'read' && (
@@ -354,7 +356,11 @@ export default function LessonPage() {
                 )}
               </div>
             ) : (
-              <div className="space-y-8" style={{ maxWidth: '62ch' }}>
+              // Desktop (xl): the handoff's reading column (max 660px) beside a
+              // sticky 340px rail with Why this matters, the actions and
+              // prev/next. Narrower screens stack everything in one column.
+              <div className="xl:grid xl:grid-cols-[minmax(0,660px)_340px] xl:gap-12 xl:items-start">
+                <div className="space-y-8 min-w-0">
                 {anchorMiss && (
                   <div className="rounded-lg px-4 py-3 text-[13px] text-n400" style={{ background: 'var(--color-surface)' }}>
                     Couldn&rsquo;t locate this quote in the lesson text:{' '}
@@ -377,6 +383,7 @@ export default function LessonPage() {
                   </div>
                 )}
 
+                <div className="xl:hidden">
                 {lesson.why_it_matters && (
                   <div>
                     <p className="text-[11px] font-medium text-n600 uppercase tracking-wide mb-2">Why this matters</p>
@@ -384,6 +391,7 @@ export default function LessonPage() {
                   </div>
                 )}
 
+                </div>
                 {/* Course text — the primary body and the only anchor target */}
                 <LessonSource
                   text={lesson.source_content}
@@ -406,6 +414,7 @@ export default function LessonPage() {
                   />
                 </div>
 
+                <div className="xl:hidden space-y-8">
                 {!completedAt ? (
                   <div className="space-y-2">
                     <button
@@ -427,6 +436,7 @@ export default function LessonPage() {
                   </p>
                 )}
 
+                <LessonPager lessonId={lesson.id} emphasiseNext={!!completedAt} />
                 {isAdmin && (
                   <div className="pt-4 space-y-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
                     <p className="text-[11px] font-medium text-n600 uppercase tracking-wide">Admin</p>
@@ -436,13 +446,56 @@ export default function LessonPage() {
                     <ClearLesson lessonId={lesson.id} onCleared={reloadContent} />
                   </div>
                 )}
+                </div>
+                </div>
+
+                <aside className="hidden xl:block xl:sticky xl:top-6 space-y-6">
+                {lesson.why_it_matters && (
+                  <div>
+                    <p className="text-[11px] font-medium text-n600 uppercase tracking-wide mb-2">Why this matters</p>
+                    <p className="text-[16px] text-n400 leading-[1.75]" style={{ textWrap: 'pretty' }}>{lesson.why_it_matters}</p>
+                  </div>
+                )}
+
+                {!completedAt ? (
+                  <div className="space-y-2">
+                    <button
+                      onClick={handleMarkComplete}
+                      className="btn btn-secondary btn-block"
+                      style={{ paddingTop: '10px', paddingBottom: '10px' }}
+                    >
+                      Mark as completed
+                    </button>
+                    {cards.length > 0 && (
+                      <p className="text-[12px] text-n600 text-center">
+                        Adds this lesson&rsquo;s cards to your review schedule.
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-[12px] text-n600 text-center">
+                    Completed {new Date(completedAt).toLocaleDateString()}
+                  </p>
+                )}
+
+                <LessonPager lessonId={lesson.id} emphasiseNext={!!completedAt} />
+                {isAdmin && (
+                  <div className="pt-4 space-y-2" style={{ borderTop: '1px solid var(--color-divider)' }}>
+                    <p className="text-[11px] font-medium text-n600 uppercase tracking-wide">Admin</p>
+                    <p className="text-[12px] text-n600 leading-relaxed">
+                      Pasted into the wrong lesson? Clearing returns it to &ldquo;not added&rdquo; so it can be pasted again.
+                    </p>
+                    <ClearLesson lessonId={lesson.id} onCleared={reloadContent} />
+                  </div>
+                )}
+                </aside>
               </div>
             )
           )}
 
           {/* ── Cards tab ── */}
           {tab === 'cards' && (
-            <div>
+            <div className="max-w-2xl">
               {cards.length === 0 ? (
                 drillMessage
               ) : (reviewDone || reviewQueue.length === 0) ? (
@@ -495,7 +548,7 @@ export default function LessonPage() {
 
           {/* ── Practice tab ── */}
           {tab === 'practice' && (
-            <div className="space-y-5">
+            <div className="space-y-5 max-w-2xl">
               {questions.length === 0 ? (
                 drillMessage
               ) : (
@@ -617,6 +670,12 @@ export default function LessonPage() {
                   </div>
                 </>
               )}
+            </div>
+          )}
+
+          {tab !== 'read' && (
+            <div className="mt-10 max-w-2xl">
+              <LessonPager lessonId={lesson.id} emphasiseNext={!!completedAt} />
             </div>
           )}
         </div>

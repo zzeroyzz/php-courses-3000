@@ -5,7 +5,6 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
-import { AppNav } from '@/components/AppNav';
 import { CardSkeleton } from '@/components/Skeleton';
 import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
 import { getViewer } from '@/lib/viewer';
@@ -108,9 +107,8 @@ export default function SectionPage() {
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
-      <AppNav />
 
-      <div className="md:ml-56">
+      <div >
         {/* Header */}
         <header className="px-5 py-4 md:px-8" style={{ borderBottom: '1px solid var(--color-divider)' }}>
           <Link

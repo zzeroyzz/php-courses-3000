@@ -2,54 +2,92 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useMemo, useState } from 'react';
-import { House, Cards, Plus, UserPlus } from '@phosphor-icons/react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { House, Cards, Plus, UserPlus, ListBullets, SidebarSimple, X, SignOut } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
-import * as db from '@/lib/db';
-import { getLevelInfo } from '@/lib/gamification';
-import { getViewer } from '@/lib/viewer';
+import { useCourse } from '@/lib/course-context';
 import { APP_NAME } from '@/lib/course';
-import { sectionLabel } from '@/lib/db-types';
-import type { Section, Profile } from '@/lib/db-types';
+import { CourseProgress, CourseTree } from './CourseTree';
 
-type RailData = { sections: Section[]; totalDue: number; profile: Profile | null; isAdmin: boolean };
+// App shell. Desktop: a left rail holding the nav and the course tree, which
+// collapses to a slim icon rail. Phone: a bottom bar, with the course tree in
+// a full-screen sheet. Course data comes from the shared CourseProvider in
+// app/(app)/layout.tsx, so navigating no longer refetches anything here.
 
 const NAV = [
-  { href: '/',        label: 'Home',   Icon: House, adminOnly: false },
-  { href: '/review',  label: 'Review', Icon: Cards, adminOnly: false },
-  { href: '/ingest',  label: 'Add',    Icon: Plus,  adminOnly: true  },
-  { href: '/admin/invites', label: 'Invites', Icon: UserPlus, adminOnly: true },
+  { href: '/',              label: 'Home',    Icon: House,    adminOnly: false },
+  { href: '/review',        label: 'Review',  Icon: Cards,    adminOnly: false },
+  { href: '/ingest',        label: 'Add',     Icon: Plus,     adminOnly: true  },
+  { href: '/admin/invites', label: 'Invites', Icon: UserPlus, adminOnly: true  },
 ] as const;
+
+export const RAIL_WIDTH = { open: 'md:pl-72', closed: 'md:pl-16' } as const;
+
+// ── Rail collapse, remembered per browser ─────────────────────────────────────
+// A per-viewer convenience, so localStorage is fine; read through
+// useSyncExternalStore so the server render and first client render agree.
+
+const RAIL_KEY = 'rail-collapsed';
+const railListeners = new Set<() => void>();
+
+function readRailCollapsed(): boolean {
+  try { return localStorage.getItem(RAIL_KEY) === '1'; } catch { return false; }
+}
+
+export function setRailCollapsed(collapsed: boolean) {
+  try { localStorage.setItem(RAIL_KEY, collapsed ? '1' : '0'); } catch { /* storage blocked: session-only */ }
+  railListeners.forEach((l) => l());
+}
+
+export function useRailCollapsed(): boolean {
+  return useSyncExternalStore(
+    (onChange) => { railListeners.add(onChange); return () => { railListeners.delete(onChange); }; },
+    readRailCollapsed,
+    () => false
+  );
+}
+
+// ── Nav ───────────────────────────────────────────────────────────────────────
 
 export function AppNav() {
   const pathname = usePathname();
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
-  const [rail, setRail] = useState<RailData | null>(null);
+  const course = useCourse();
+  const collapsed = useRailCollapsed();
+  const [sheetOpen, setSheetOpen] = useState(false);
 
+  // Close the phone sheet on any navigation (including browser back).
+  const [sheetPath, setSheetPath] = useState(pathname);
+  if (sheetPath !== pathname) { setSheetPath(pathname); setSheetOpen(false); }
+
+  // The sheet covers the page; stop the page behind it from scrolling.
   useEffect(() => {
-    (async () => {
-      const [viewer, sections, dueCounts] = await Promise.all([
-        getViewer(supabase),
-        db.getSections(supabase),
-        db.getDueCounts(supabase),
-      ]);
-      if (!viewer) return;
-      const totalDue = dueCounts.reduce((s, d) => s + d.due, 0);
-      setRail({ sections, totalDue, profile: viewer.profile, isAdmin: viewer.isAdmin });
-    })();
-  }, [supabase]);
+    if (!sheetOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, [sheetOpen]);
 
   async function signOut() {
     await supabase.auth.signOut();
     router.push('/sign-in');
   }
 
-  const active = (href: string) =>
-    href === '/' ? pathname === '/' : pathname.startsWith(href);
+  const isAdmin = course?.viewer.isAdmin ?? false;
+  const items = NAV.filter((item) => !item.adminOnly || isAdmin);
+  const totalDue = course?.totalDue ?? 0;
+  const active = (href: string) => (href === '/' ? pathname === '/' : pathname.startsWith(href));
 
-  // Admin-only items stay hidden until the role is known, so they never flash in.
-  const navItems = NAV.filter((item) => !item.adminOnly || rail?.isAdmin);
+  const badge = (href: string, small = false) =>
+    href === '/review' && totalDue > 0 ? (
+      <span
+        className={`${small ? 'absolute -top-1 -right-1.5 min-w-[14px] h-3.5 text-[9px] px-0.5' : 'min-w-[18px] h-[18px] text-[10px] px-1'} flex items-center justify-center rounded-full font-medium tabular-nums`}
+        style={{ background: 'var(--color-accent-dk)', color: 'var(--color-accent-lo)' }}
+      >
+        {totalDue}
+      </span>
+    ) : null;
 
   return (
     <>
@@ -59,121 +97,120 @@ export function AppNav() {
         style={{ background: 'var(--color-surface-sunk)', boxShadow: '0 -1px 0 rgba(233,233,237,.1)' }}
       >
         <div className="flex">
-          {navItems.map(({ href, label, Icon }) => {
-            const isActive = active(href);
-            const badge = href === '/review' && rail && rail.totalDue > 0 ? rail.totalDue : null;
-            return (
-              <Link
-                key={href}
-                href={href}
-                className="flex flex-1 flex-col items-center gap-1 py-2.5"
-                style={{ color: isActive ? 'var(--color-accent)' : 'var(--color-n600)' }}
-              >
+          {[items[0], { href: '#course', label: 'Course', Icon: ListBullets, adminOnly: false } as const, ...items.slice(1)].map(({ href, label, Icon }) => {
+            const isCourse = href === '#course';
+            const isActive = isCourse ? sheetOpen : !sheetOpen && active(href);
+            const inner = (
+              <>
                 <span className="relative">
                   <Icon size={20} weight={isActive ? 'fill' : 'regular'} />
-                  {badge && (
-                    <span
-                      className="absolute -top-1 -right-1.5 min-w-[14px] h-3.5 flex items-center justify-center rounded-full px-0.5 text-[9px] font-medium tabular-nums"
-                      style={{ background: 'var(--color-accent)', color: '#fff' }}
-                    >
-                      {badge}
-                    </span>
-                  )}
+                  {badge(href, true)}
                 </span>
                 <span className="text-[11px] font-medium">{label}</span>
-              </Link>
+              </>
+            );
+            const cls = 'flex flex-1 flex-col items-center gap-1 py-2.5 min-h-[52px]';
+            const color = { color: isActive ? 'var(--color-accent)' : 'var(--color-n600)' };
+            return isCourse ? (
+              <button key={href} onClick={() => setSheetOpen((o) => !o)} aria-expanded={sheetOpen} className={cls} style={color}>{inner}</button>
+            ) : (
+              <Link key={href} href={href} className={cls} style={color}>{inner}</Link>
             );
           })}
         </div>
       </nav>
 
-      {/* ── Desktop left rail ── */}
+      {/* ── Phone course sheet ── */}
+      {sheetOpen && (
+        <div className="md:hidden fixed inset-0 z-40 flex flex-col" style={{ background: 'var(--color-bg)' }}>
+          <div className="flex items-center justify-between px-5 pt-4 pb-3" style={{ borderBottom: '1px solid var(--color-divider)', paddingTop: 'max(16px, env(safe-area-inset-top))' }}>
+            <span className="text-[17px] font-medium text-fg">Course</span>
+            <button onClick={() => setSheetOpen(false)} aria-label="Close course" className="p-2 -mr-2 text-n500 hover:text-fg">
+              <X size={20} />
+            </button>
+          </div>
+          <div className="px-5 py-4" style={{ borderBottom: '1px solid var(--color-divider)' }}>
+            <CourseProgress />
+          </div>
+          <div className="flex-1 overflow-y-auto px-3 py-3 pb-28" style={{ overscrollBehavior: 'contain' }}>
+            <CourseTree onNavigate={() => setSheetOpen(false)} />
+          </div>
+        </div>
+      )}
+
+      {/* ── Desktop rail ── */}
       <aside
-        className="hidden md:flex flex-col fixed top-0 left-0 bottom-0 w-56 z-50"
-        style={{ background: 'var(--color-surface)', borderRight: '1px solid var(--color-divider)' }}
+        className={`hidden md:flex flex-col fixed top-0 left-0 bottom-0 z-50 ${collapsed ? 'w-16' : 'w-72'}`}
+        style={{ background: 'var(--color-surface-sunk)', borderRight: '1px solid var(--color-divider)' }}
       >
-        {/* Brand */}
-        <div className="px-5 py-5" style={{ borderBottom: '1px solid var(--color-divider)' }}>
-          <Link href="/" className="text-[15px] font-medium text-fg">{APP_NAME}</Link>
+        <div className={`flex items-center ${collapsed ? 'justify-center' : 'justify-between'} px-4 py-4`}>
+          {!collapsed && <Link href="/" className="text-[15px] font-medium text-fg truncate">{APP_NAME}</Link>}
+          <button
+            onClick={() => setRailCollapsed(!collapsed)}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className="p-1.5 rounded-lg text-n600 hover:text-fg hover:bg-dim transition-colors"
+          >
+            <SidebarSimple size={18} />
+          </button>
         </div>
 
-        {/* Nav items */}
-        <div className="px-3 py-4 space-y-0.5">
-          {navItems.map(({ href, label, Icon }) => {
+        <div className={`px-3 pb-3 space-y-0.5 ${collapsed ? 'flex flex-col items-center' : ''}`}>
+          {items.map(({ href, label, Icon }) => {
             const isActive = active(href);
-            const badge = href === '/review' && rail && rail.totalDue > 0 ? rail.totalDue : null;
             return (
               <Link
                 key={href}
                 href={href}
-                className="flex items-center gap-3 px-3 py-2 rounded-lg text-[14px] font-medium transition-colors"
+                title={collapsed ? label : undefined}
+                className={`relative flex items-center gap-3 rounded-lg text-[14px] font-medium transition-colors ${collapsed ? 'p-2.5 justify-center' : 'px-3 py-2'}`}
                 style={{
-                  color: isActive ? 'var(--color-fg)' : 'var(--color-n500)',
-                  background: isActive ? 'var(--color-dim)' : 'transparent',
+                  color: isActive ? 'var(--color-accent-hi)' : 'var(--color-n500)',
+                  background: isActive ? 'var(--color-accent-tint)' : 'transparent',
                 }}
               >
-                <Icon size={18} weight={isActive ? 'fill' : 'regular'} />
-                <span className="flex-1">{label}</span>
-                {badge && (
-                  <span
-                    className="min-w-[18px] h-[18px] flex items-center justify-center rounded-full px-1 text-[10px] font-medium tabular-nums"
-                    style={{ background: 'var(--color-accent)', color: '#fff' }}
-                  >
-                    {badge}
-                  </span>
-                )}
+                <span className="relative">
+                  <Icon size={18} weight={isActive ? 'fill' : 'regular'} />
+                  {collapsed && badge(href, true)}
+                </span>
+                {!collapsed && <span className="flex-1">{label}</span>}
+                {!collapsed && badge(href)}
               </Link>
             );
           })}
+          {collapsed && (
+            <button
+              onClick={() => setRailCollapsed(false)}
+              title="Course"
+              aria-label="Show course"
+              className="p-2.5 rounded-lg text-n500 hover:text-fg hover:bg-dim transition-colors"
+            >
+              <ListBullets size={18} />
+            </button>
+          )}
         </div>
 
-        {/* Section links */}
-        {rail && rail.sections.length > 0 && (
-          <div
-            className="px-3 pb-3 flex-1 overflow-y-auto"
-            style={{ borderTop: '1px solid var(--color-divider)' }}
-          >
-            <p className="px-3 pt-4 pb-2 text-[11px] font-medium uppercase tracking-wide text-n600">
-              Chapters
-            </p>
-            {rail.sections.map((s) => (
-              <Link
-                key={s.id}
-                href={`/sections/${s.slug}`}
-                title={sectionLabel(s)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[13px] transition-colors text-n500 hover:text-fg"
-              >
-                <span className="w-1 h-1 rounded-full bg-n700 shrink-0" />
-                <span className="truncate">{sectionLabel(s)}</span>
-              </Link>
-            ))}
-          </div>
+        {!collapsed && (
+          <>
+            <div className="px-5 py-4" style={{ borderTop: '1px solid var(--color-divider)' }}>
+              <CourseProgress />
+            </div>
+            <div className="flex-1 overflow-y-auto px-3 pb-3" style={{ overscrollBehavior: 'contain' }}>
+              <CourseTree />
+            </div>
+          </>
         )}
 
-        {/* Footer */}
-        {rail && rail.profile && (() => {
-          const { level } = getLevelInfo(rail.profile!.xp);
-          return (
-            <div
-              className="px-5 py-4 mt-auto"
-              style={{ borderTop: '1px solid var(--color-divider)' }}
-            >
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-[13px] text-n400">
-                  {rail.profile!.current_streak} day streak
-                  {rail.profile!.current_streak > 0 ? ' 🔥' : ''}
-                </span>
-                <span className="text-[11px] text-n600">Lv {level}</span>
-              </div>
-              <button
-                onClick={signOut}
-                className="text-[13px] text-n600 hover:text-n400 transition-colors"
-              >
-                Sign out
-              </button>
-            </div>
-          );
-        })()}
+        <div className={`mt-auto px-4 py-3 ${collapsed ? 'flex justify-center' : ''}`} style={{ borderTop: '1px solid var(--color-divider)' }}>
+          <button
+            onClick={signOut}
+            title="Sign out"
+            className="flex items-center gap-2 text-[13px] text-n600 hover:text-n400 transition-colors"
+          >
+            <SignOut size={16} />
+            {!collapsed && 'Sign out'}
+          </button>
+        </div>
       </aside>
     </>
   );

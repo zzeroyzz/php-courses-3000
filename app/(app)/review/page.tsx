@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/utils/supabase/client';
-import { AppNav } from '@/components/AppNav';
 import * as db from '@/lib/db';
 import { scheduleCard, shuffle } from '@/lib/srs';
 import type { StudyCard } from '@/lib/db-types';
@@ -59,9 +58,8 @@ export default function ReviewPage() {
 
   return (
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
-      <AppNav />
 
-      <div className="md:ml-56">
+      <div >
         <header
           className="px-5 py-4 md:px-8"
           style={{ borderBottom: '1px solid var(--color-divider)' }}
