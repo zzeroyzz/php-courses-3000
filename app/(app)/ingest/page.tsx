@@ -171,7 +171,7 @@ function Ingest() {
     <div className="min-h-dvh bg-bg pb-24 md:pb-8">
 
       <div >
-        <div className="max-w-2xl mx-auto w-full px-5 py-6 space-y-5">
+        <div className="max-w-2xl md:max-w-[1100px] mx-auto w-full px-5 md:px-8 py-6 space-y-5">
           <header>
             <h1 className="text-[17px] font-medium text-fg">Add lesson content</h1>
             <p className="text-[13px] text-n500 mt-0.5">
@@ -209,15 +209,19 @@ function Ingest() {
           )}
 
           {/* Form */}
+          {/* Phone: one column in DOM order. Desktop (handoff spec): the paste
+              area is the page, with a 320px column for chapter, lesson and the
+              button. */}
           {lesson && section && step !== 'done' && (
-            <div className="space-y-4">
+            <div className="grid gap-4 md:gap-x-8 md:grid-cols-[minmax(0,1fr)_320px] md:[grid-template-areas:'err_err'_'text_side'_'text_actions']">
               {errorMsg && step === 'error' && (
-                <div className="rounded-lg px-4 py-3 text-[13px] text-n400"
+                <div className="rounded-lg px-4 py-3 text-[13px] text-n400 md:[grid-area:err]"
                   style={{ background: 'var(--color-surface)', border: '1px solid var(--color-divider)' }}>
                   {errorMsg}
                 </div>
               )}
 
+              <div className="space-y-4 md:[grid-area:side]">
               <div className="field">
                 <label>Chapter</label>
                 <select
@@ -264,8 +268,9 @@ function Ingest() {
                   <p className="text-[12px] text-n600 mt-1.5 leading-relaxed">{KIND_HINT[lesson.kind]}</p>
                 )}
               </div>
+              </div>
 
-              <div className="field">
+              <div className="field md:[grid-area:text]">
                 <label>Source content</label>
                 <textarea
                   rows={14}
@@ -273,7 +278,7 @@ function Ingest() {
                   value={sourceContent}
                   onChange={(e) => setSourceContent(e.target.value)}
                   disabled={!isActive}
-                  className="input"
+                  className="input md:min-h-[520px] md:text-[15px]"
                   style={{ resize: 'none', lineHeight: '1.65' }}
                 />
                 <div className="flex items-center justify-between mt-1.5">
@@ -288,6 +293,7 @@ function Ingest() {
                 </div>
               </div>
 
+              <div className="space-y-3 md:[grid-area:actions] md:self-start">
               <button
                 onClick={handleSubmit}
                 disabled={!canSubmit || !isActive}
@@ -319,6 +325,7 @@ function Ingest() {
                   </div>
                 </div>
               )}
+              </div>
             </div>
           )}
         </div>
