@@ -216,6 +216,26 @@ export async function clearLesson(supabase: SupabaseClient, lessonId: string): P
   return true;
 }
 
+// Card and question counts per lesson in a section, via PostgREST's embedded
+// count (one request, no rows transferred beyond the counts).
+export type ContentCounts = { cards: number; questions: number };
+
+export async function getContentCounts(
+  supabase: SupabaseClient,
+  sectionId: string
+): Promise<Map<string, ContentCounts>> {
+  const { data, error } = await supabase
+    .from('lessons')
+    .select('id, flashcards(count), questions(count)')
+    .eq('section_id', sectionId);
+  if (error) { console.error('[db] getContentCounts', error.message); return new Map(); }
+  type Row = { id: string; flashcards: { count: number }[]; questions: { count: number }[] };
+  return new Map((data as unknown as Row[]).map((r) => [
+    r.id,
+    { cards: r.flashcards[0]?.count ?? 0, questions: r.questions[0]?.count ?? 0 },
+  ]));
+}
+
 // How many students have progress that regenerating this lesson would erase.
 export async function getLessonLearnerCount(
   supabase: SupabaseClient,

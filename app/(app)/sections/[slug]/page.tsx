@@ -22,6 +22,9 @@ import type { ContentStatus, Section, LessonSummary } from '@/lib/db-types';
 
 type RowStatus = ContentStatus | 'completed';
 
+// Desktop table columns: Lesson / Contents / Status / Due.
+const TABLE_COLS = 'md:grid md:grid-cols-[minmax(0,1fr)_170px_96px_48px] md:items-center md:gap-4';
+
 export default function SectionPage() {
   const { slug } = useParams<{ slug: string }>();
   const router = useRouter();
@@ -30,6 +33,7 @@ export default function SectionPage() {
   const [section, setSection] = useState<Section | null>(null);
   const [lessons, setLessons] = useState<LessonSummary[]>([]);
   const [dueCounts, setDueCounts] = useState<Record<string, number>>({});
+  const [contentCounts, setContentCounts] = useState<Map<string, db.ContentCounts>>(new Map());
   const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -39,7 +43,12 @@ export default function SectionPage() {
   const [actionError, setActionError] = useState<{ lessonId: string; message: string } | null>(null);
 
   const reloadLessons = useCallback(async (sectionId: string) => {
-    setLessons(await db.getLessonSummaries(supabase, sectionId));
+    const [summaries, counts] = await Promise.all([
+      db.getLessonSummaries(supabase, sectionId),
+      db.getContentCounts(supabase, sectionId),
+    ]);
+    setLessons(summaries);
+    setContentCounts(counts);
   }, [supabase]);
 
   useEffect(() => {
@@ -50,11 +59,13 @@ export default function SectionPage() {
       const sect = await db.getSectionBySlug(supabase, slug);
       if (!sect) { router.push('/'); return; }
 
-      const [sectionLessons, due, completed] = await Promise.all([
+      const [sectionLessons, due, completed, counts] = await Promise.all([
         db.getLessonSummaries(supabase, sect.id),
         db.getDueCounts(supabase),
         db.getCompletedLessonIds(supabase),
+        db.getContentCounts(supabase, sect.id),
       ]);
+      setContentCounts(counts);
 
       setSection(sect);
       setLessons(sectionLessons);
@@ -140,7 +151,7 @@ export default function SectionPage() {
           )}
         </header>
 
-        <div className="max-w-2xl mx-auto px-5 py-6 space-y-2">
+        <div className="max-w-2xl md:max-w-[960px] mx-auto px-5 md:px-8 py-6 space-y-2">
           {loading ? (
             Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} />)
           ) : lessons.length === 0 ? (
@@ -156,6 +167,12 @@ export default function SectionPage() {
                 </p>
               )}
 
+              {/* Phone: a list of cards. Desktop (handoff spec): one table —
+                  Lesson / Contents / Status / Due — with fading row rules. */}
+              <div className="space-y-2 md:space-y-0 md:rounded-lg md:overflow-hidden md:bg-surface">
+              <div className={`hidden ${TABLE_COLS} px-4 py-2.5 text-[11px] font-medium uppercase tracking-wide text-n600`}>
+                <span>Lesson</span><span>Contents</span><span>Status</span><span className="text-right">Due</span>
+              </div>
               {lessons.map((lesson) => {
                 const content = contentStatus(lesson, now);
                 const status: RowStatus = content === 'ready' && completedIds.has(lesson.id) ? 'completed' : content;
@@ -164,65 +181,68 @@ export default function SectionPage() {
                 const isConfirming = confirming?.lessonId === lesson.id;
                 const error = actionError?.lessonId === lesson.id ? actionError.message : null;
                 const refresh = () => section && reloadLessons(section.id);
+                const counts = contentCounts.get(lesson.id);
+                const contents =
+                  content === 'empty' ? null
+                  : counts && (counts.cards || counts.questions) ? `${counts.cards} cards \u00b7 ${counts.questions} questions`
+                  : lesson.kind === 'document' ? 'Reading only'
+                  : '\u2014';
 
                 // Empty lessons: dimmed and inert for students; a paste link for admins.
                 if (content === 'empty') {
                   const emptyLabel = lesson.kind === 'infographic' ? 'Image-only lesson' : 'Not added yet';
                   const titleRow = (
-                    <div className="flex items-start justify-between gap-4 px-4 py-3">
-                      <p className="text-[14px] text-n600 leading-snug">
+                    <div className={`flex items-start justify-between gap-4 px-4 py-3 ${TABLE_COLS}`}>
+                      <p className="text-[14px] text-n600 leading-snug min-w-0">
                         {number && <span className="tabular-nums mr-2">{number}</span>}
                         {lesson.title}
                       </p>
-                      <span className="text-[11px] text-n700 shrink-0 mt-0.5">
-                        {isAdmin ? 'Paste content →' : emptyLabel}
+                      <span className="hidden md:block text-[12px] text-n700">\u2014</span>
+                      <span className="text-[11px] text-n700 shrink-0 mt-0.5 md:mt-0">
+                        {isAdmin ? 'Paste content \u2192' : emptyLabel}
                       </span>
+                      <span className="hidden md:block" />
                     </div>
                   );
+                  const rowClass = 'block rounded-lg border border-dashed border-divider md:rounded-none md:border-0 table-row-rule';
                   return isAdmin ? (
-                    <Link
-                      key={lesson.id}
-                      href={`/ingest?lesson=${lesson.id}`}
-                      className="block rounded-lg hover:bg-dim transition-colors"
-                      style={{ border: '1px dashed var(--color-divider)' }}
-                    >
+                    <Link key={lesson.id} href={`/ingest?lesson=${lesson.id}`} className={`${rowClass} hover:bg-dim transition-colors`}>
                       {titleRow}
                     </Link>
                   ) : (
-                    <div key={lesson.id} className="rounded-lg" style={{ border: '1px dashed var(--color-divider)' }}>
-                      {titleRow}
-                    </div>
+                    <div key={lesson.id} className={rowClass}>{titleRow}</div>
                   );
                 }
 
                 return (
                   <div
                     key={lesson.id}
-                    className="rounded-lg overflow-hidden"
-                    style={{ background: 'var(--color-surface)' }}
+                    className="rounded-lg overflow-hidden bg-surface md:rounded-none md:bg-transparent table-row-rule"
                   >
                     <Link
                       href={`/lessons/${lesson.id}`}
-                      className="flex items-start justify-between gap-4 px-4 py-3.5 hover:bg-dim transition-colors group"
+                      className={`flex items-start justify-between gap-4 px-4 py-3.5 hover:bg-dim transition-colors group ${TABLE_COLS}`}
                     >
                       <div className="flex-1 min-w-0">
-                        <p className="text-[15px] font-medium text-fg leading-snug group-hover:text-accent-md transition-colors">
+                        <p className="text-[15px] md:text-[14px] font-medium text-fg leading-snug group-hover:text-accent-md transition-colors">
                           {number && <span className="tabular-nums text-n500 font-normal mr-2">{number}</span>}
                           {lesson.title}
                         </p>
-                        {(status === 'ready' || status === 'completed') && lesson.generated_at && (
-                          <p className="text-[12px] text-n600 mt-0.5 tabular-nums">
-                            {due > 0
-                              ? <span style={{ color: 'var(--color-accent-md)' }}>{due} due</span>
-                              : status === 'completed' ? 'Completed' : 'Ready to study'}
-                          </p>
-                        )}
+                        <p className="md:hidden text-[12px] text-n600 mt-0.5 tabular-nums">
+                          {contents}
+                          {due > 0 && <> \u00b7 <span style={{ color: 'var(--color-accent-md)' }}>{due} due</span></>}
+                          {due === 0 && status === 'completed' && ' \u00b7 Completed'}
+                        </p>
                       </div>
-                      <StatusTag status={status} kind={lesson.kind} />
+                      <span className="hidden md:block text-[12px] text-n500 tabular-nums">{contents}</span>
+                      <span className="shrink-0"><StatusTag status={status} kind={lesson.kind} /></span>
+                      <span className="hidden md:block text-right text-[12px] tabular-nums" style={{ color: due > 0 ? 'var(--color-accent-md)' : 'var(--color-n700)' }}>
+                        {due > 0 ? due : '\u2014'}
+                      </span>
                     </Link>
 
                     {(status === 'ready' || status === 'completed') && lesson.generated_at && !isConfirming && (
-                      <div className="flex items-center" style={{ borderTop: '1px solid var(--color-divider)' }}>
+                      <div className={`flex items-center ${isAdmin ? '' : 'md:hidden'}`} style={{ borderTop: '1px solid var(--color-divider)' }}>
                         <Link
                           href={`/lessons/${lesson.id}?tab=cards`}
                           className="flex-1 text-center py-2 text-[12px] text-n600 hover:text-fg transition-colors"
@@ -310,6 +330,7 @@ export default function SectionPage() {
                   </div>
                 );
               })}
+              </div>
             </>
           )}
         </div>

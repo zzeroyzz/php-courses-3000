@@ -175,6 +175,22 @@ body {
   ) no-repeat bottom / 100% 1px;
 }
 
+/* Section table (md+): the same fading rule above each row. */
+@media (min-width: 768px) {
+  .table-row-rule {
+    background-image: linear-gradient(
+      to right,
+      transparent,
+      var(--color-divider) 48px,
+      var(--color-divider) calc(100% - 48px),
+      transparent
+    );
+    background-repeat: no-repeat;
+    background-position: top;
+    background-size: 100% 1px;
+  }
+}
+
 /* ── Utilities ── */
 .pb-safe {
   padding-bottom: max(10px, env(safe-area-inset-bottom));
