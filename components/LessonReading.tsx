@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useSyncExternalStore } from 'react';
 import type { Lesson, Section } from '@/lib/db-types';
 
 // Reading surface of the lesson page: the course text, the anchor matching that
@@ -293,6 +293,24 @@ export function revealRange(range: Range, scroller: HTMLElement | null) {
 // Either way the full text is always in the DOM, so anchor matching works, and
 // "Going deeper ↓" skips straight past it.
 export type SourceLayout = 'box' | 'collapse';
+
+// Default: the box where there's room for it, collapse on phones, where a
+// scroll area inside the page is awkward and studying mostly happens. Same
+// 768px breakpoint as the rest of the app. ?source=box|collapse overrides.
+const WIDE = '(min-width: 768px)';
+
+export function useDefaultSourceLayout(): SourceLayout {
+  const wide = useSyncExternalStore(
+    (onChange) => {
+      const mq = window.matchMedia(WIDE);
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    },
+    () => window.matchMedia(WIDE).matches,
+    () => false
+  );
+  return wide ? 'box' : 'collapse';
+}
 
 export function LessonSource({
   text, layout, expanded, onExpandedChange, contentRef, scrollerRef, hasDepth,

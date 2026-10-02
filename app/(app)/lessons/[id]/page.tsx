@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { ArrowLeft } from '@phosphor-icons/react';
 import { createClient } from '@/utils/supabase/client';
 import { StopGeneration, ClearLesson } from '@/components/GenerationControls';
-import { DepthLayer, LessonSource, findInSource, revealRange } from '@/components/LessonReading';
+import { DepthLayer, LessonSource, findInSource, revealRange, useDefaultSourceLayout } from '@/components/LessonReading';
 import type { SourceLayout } from '@/components/LessonReading';
 import { startGeneration } from '@/lib/generation-client';
 import { useNow } from '@/lib/use-now';
@@ -74,12 +74,23 @@ export default function LessonPage() {
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(searchParams.get('anchor'));
   const [anchorMiss, setAnchorMiss] = useState<string | null>(null);
 
-  // How the course text is contained. 'box' unless ?source=collapse — a
-  // temporary switch so both candidates can be compared on real lessons.
-  const sourceLayout: SourceLayout = searchParams.get('source') === 'collapse' ? 'collapse' : 'box';
-  // A collapsed preview has to be open before a jump can show the quote, so an
-  // incoming ?anchor starts it expanded.
-  const [sourceExpanded, setSourceExpanded] = useState(sourceLayout === 'collapse' && !!searchParams.get('anchor'));
+  // How the course text is contained: box on wide screens, collapse on phones
+  // (useDefaultSourceLayout). ?source=box or ?source=collapse forces one, so
+  // the two can be compared on any device.
+  const forcedLayout = searchParams.get('source');
+  const defaultLayout = useDefaultSourceLayout();
+  const sourceLayout: SourceLayout =
+    forcedLayout === 'box' || forcedLayout === 'collapse' ? forcedLayout : defaultLayout;
+  const [sourceExpanded, setSourceExpanded] = useState(false);
+  // A collapsed preview must be open before a jump can show the quote, and
+  // should stay open afterwards: an anchor (from the URL or a card) opens it
+  // until the reader collapses it again.
+  const [openedByAnchor, setOpenedByAnchor] = useState(!!searchParams.get('anchor'));
+  const textExpanded = sourceExpanded || (sourceLayout === 'collapse' && openedByAnchor);
+  function setTextExpanded(expanded: boolean) {
+    setSourceExpanded(expanded);
+    if (!expanded) setOpenedByAnchor(false);
+  }
 
   const sourceRef = useRef<HTMLDivElement>(null);
   const sourceScrollerRef = useRef<HTMLDivElement>(null);
@@ -166,19 +177,19 @@ export default function LessonPage() {
       sel?.removeAllRanges();
       sel?.addRange(range);
       // In the box layout the quote can be inside the box's own scroll area.
-      revealRange(range, sourceLayout === 'box' && !sourceExpanded ? sourceScrollerRef.current : null);
+      revealRange(range, sourceLayout === 'box' && !textExpanded ? sourceScrollerRef.current : null);
     } else {
       setAnchorMiss(pendingAnchor);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
     setPendingAnchor(null);
-  }, [pendingAnchor, tab, lesson, sourceExpanded, sourceLayout]);
+  }, [pendingAnchor, tab, lesson, textExpanded, sourceLayout]);
 
   function jumpToSource(anchor: string | null) {
     if (!anchor) return;
     setPendingAnchor(anchor);
     setTab('read');
-    if (sourceLayout === 'collapse') setSourceExpanded(true);
+    setOpenedByAnchor(true);
   }
 
   async function handleCardAnswer(correct: boolean) {
@@ -396,8 +407,8 @@ export default function LessonPage() {
                 <LessonSource
                   text={lesson.source_content}
                   layout={sourceLayout}
-                  expanded={sourceExpanded}
-                  onExpandedChange={setSourceExpanded}
+                  expanded={textExpanded}
+                  onExpandedChange={setTextExpanded}
                   contentRef={sourceRef}
                   scrollerRef={sourceScrollerRef}
                   hasDepth={!!lesson.depth_content}
